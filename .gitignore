@@ -1,0 +1,8 @@
+**.DS_Store
+**/.venv/
+**/screen_kepek/
+**/.idea/
+**/jupvenv/
+**/cache/
+**/adatok/
+**/__pycache__/
