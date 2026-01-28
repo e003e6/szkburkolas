@@ -20,7 +20,7 @@ def norm_utca(s):
          .str.replace(r'\s+', ' ', regex=True).str.strip().str.lower()
     )
 
-def norm_hazszam(s: pd.Series) -> pd.Series:
+def norm_hazszam(s):
     return (s.astype(str)
               .str.strip()
               .str.replace(r'\.0$','', regex=True)    # 29.0 → 29
