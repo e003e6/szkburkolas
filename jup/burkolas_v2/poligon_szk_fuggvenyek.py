@@ -4,8 +4,9 @@ import random
 import matplotlib.pyplot as plt
 import colorsys
 
-from shapely.ops import unary_union, split
-from shapely.geometry import LineString
+from shapely.ops import unary_union, split, polygonize
+from shapely import make_valid, set_precision
+from shapely.geometry import LineString, MultiPolygon, Polygon
 
 
 
@@ -123,6 +124,10 @@ def pontok_polygonban(gdf, gdf_szigetek, max_depth=25):
 def felez(poly):
     """
     A poligont kettévágja a centroidon átmenő vágással (a hosszabb bbox tengely mentén).
+
+    A cut line csúcspontjai új koordinátákat vezetnek be (metszéspontok), amik a
+    cella eredeti 1mm rácsától eltérhetnek. set_precision-nel visszasnappeljük
+    a rácsra, hogy a szomszédos (NEM split) cellákkal az illeszkedés megmaradjon.
     """
 
     minx, miny, maxx, maxy = poly.bounds
@@ -130,16 +135,23 @@ def felez(poly):
 
     # Hosszabb irány kiválasztása
     if (maxx - minx) >= (maxy - miny):
-        # függőleges vágás (x = cx)
         vago = LineString([(cx, miny - 1), (cx, maxy + 1)])
     else:
-        # vízszintes vágás (y = cy)
         vago = LineString([(minx - 1, cy), (maxx + 1, cy)])
 
     darabok = list(split(poly, vago).geoms)
 
-    # Ha valamiért nem sikerült a vágás akkor visszaadjuk egyben
-    return darabok if len(darabok) >= 2 else [poly]
+    if len(darabok) < 2:
+        return [poly]
+
+    # Cut line új csúcsait a közös 1mm rácsra snappeljük
+    snapped = []
+    for d in darabok:
+        s = set_precision(d, grid_size=0.01)
+        if s is not None and not s.is_empty and s.geom_type in ("Polygon", "MultiPolygon"):
+            snapped.append(s)
+
+    return snapped if snapped else [poly]
 
 
 def pontok_poligonban(pts_gdf, poly):
@@ -221,54 +233,101 @@ def polygon_tobb_szavazokor(polygon_geom, points_inside, max_depth=25):
 
 
 
-def ures_polyk_besorolasa(results):
+def ures_polyk_besorolasa(results, *, max_iters=10):
     """
-    Azokat a sorokat kezeli, ahol szavazokorid hiányzik (NaN/None):
-      - megkeresi a szomszédos poligonokat (touches: közös határ/pont érintés)
-      - a szomszédok szavazokorid-jai közül a leggyakoribbat választja
-      - beírja a hiányzó szavazokorid-t és a hozzá tartozó color-t (a nyertes szomszéd első colorja)
+    Üres (szavazokorid=NaN/None) cellák besorolása szomszédokhoz.
 
-    Megjegyzés:
-      - a "szomszéd" itt: geometriailag érintkező poligon (touches)
-      - döntetlen esetén: a leggyakoribbak közül az első (deterministikus sorrend szerint) kerül kiválasztásra
+    Iterációs megközelítés a teljes lefedettség érdekében:
+      1. Minden körben megpróbálunk minden üres cellát besorolni: közös-ÉL
+         szomszédok közül a leggyakoribb szavazokorid nyer.
+      2. Ha egy körben NEM sikerül semelyik maradék üres cellát besorolni
+         (nincs szomszédjuk címkézett cellával), lazítunk:
+         először csak sarokponton érintkező szomszédokat is megengedünk,
+         majd utolsó esélyként a legközelebbi címkézett cellát (centroid
+         távolság alapján) rendeljük hozzá.
+      3. Ez garantálja, hogy nincs maradék None cella a kimenetben → nem
+         jelennek meg üres "lyukak" a sarkokban és a szavazóköri poligonok
+         belsejében.
     """
 
     out = results.copy()
 
-    # Spatial index gyorsításhoz (olvasható marad, de nem lassú)
-    sindex = out.sindex
+    def pick_winner(neighbors):
+        counts = neighbors["szavazokorid"].value_counts()
+        winner_id = counts.index[0]
+        winner_color = neighbors.loc[
+            neighbors["szavazokorid"] == winner_id, "color"
+        ].iloc[0]
+        return winner_id, winner_color
 
-    # Hiányzó szavazokorid sorok indexei (NaN is ide esik)
-    missing_idxs = out.index[out["szavazokorid"].isna()].tolist()
+    for iteration in range(max_iters):
+        missing_idxs = out.index[out["szavazokorid"].isna()].tolist()
+        if not missing_idxs:
+            break
 
-    for idx in missing_idxs:
-        geom = out.at[idx, "geometry"]
+        sindex = out.sindex
+        assigned_this_round = 0
 
-        # Jelöltek: bbox alapján (sindex), majd pontos szűrés touches-szal
-        candidate_idxs = list(sindex.intersection(geom.bounds))
-        candidates = out.loc[candidate_idxs]
+        for idx in missing_idxs:
+            geom = out.at[idx, "geometry"]
+            candidate_idxs = list(sindex.intersection(geom.bounds))
+            candidates = out.loc[candidate_idxs]
 
-        neighbors = candidates[candidates.geometry.touches(geom)]
+            # 1. próba: közös ÉL (hossz > 1 cm)
+            edge_neighbors = candidates[
+                candidates.geometry.apply(
+                    lambda g: g.boundary.intersection(geom.boundary).length > 0.01
+                ) & candidates["szavazokorid"].notna()
+            ]
+            if len(edge_neighbors) > 0:
+                wid, wcol = pick_winner(edge_neighbors)
+                out.at[idx, "szavazokorid"] = wid
+                out.at[idx, "color"] = wcol
+                assigned_this_round += 1
 
-        # Csak azok a szomszédok kellenek, ahol van szavazokorid
-        neighbors_labeled = neighbors[neighbors["szavazokorid"].notna()]
-
-        if len(neighbors_labeled) == 0:
-            # nincs kitől örökölni -> marad NaN/None
+        if assigned_this_round > 0:
             continue
 
-        # Szavazokorid többség meghatározása
-        counts = neighbors_labeled["szavazokorid"].value_counts()
+        # Nem sikerült edge-szomszéddal előrelépni → fallback: sarokérintés
+        missing_idxs = out.index[out["szavazokorid"].isna()].tolist()
+        if not missing_idxs:
+            break
 
-        winner_szavazokorid = counts.index[0]
+        sindex = out.sindex
+        for idx in missing_idxs:
+            geom = out.at[idx, "geometry"]
+            candidate_idxs = list(sindex.intersection(geom.bounds))
+            candidates = out.loc[candidate_idxs]
 
-        # Color átvétele: az első olyan szomszédból, amelyik a nyertes szavazokorid
-        winner_color = neighbors_labeled.loc[
-            neighbors_labeled["szavazokorid"] == winner_szavazokorid, "color"
-        ].iloc[0]
+            # 2. próba: bármilyen érintés (sarokpont is)
+            touch_neighbors = candidates[
+                candidates.geometry.apply(lambda g: g.intersects(geom) and g is not geom)
+                & candidates["szavazokorid"].notna()
+            ]
+            if len(touch_neighbors) > 0:
+                wid, wcol = pick_winner(touch_neighbors)
+                out.at[idx, "szavazokorid"] = wid
+                out.at[idx, "color"] = wcol
+                assigned_this_round += 1
 
-        out.at[idx, "szavazokorid"] = winner_szavazokorid
-        out.at[idx, "color"] = winner_color
+        if assigned_this_round > 0:
+            continue
+
+        # 3. próba (utolsó esély): legközelebbi címkézett cella centroid alapján
+        missing_idxs = out.index[out["szavazokorid"].isna()].tolist()
+        labeled = out[out["szavazokorid"].notna()]
+        if len(labeled) == 0 or not missing_idxs:
+            break
+
+        for idx in missing_idxs:
+            geom = out.at[idx, "geometry"]
+            c = geom.centroid
+            dists = labeled.geometry.apply(lambda g: g.centroid.distance(c))
+            nearest = labeled.loc[dists.idxmin()]
+            out.at[idx, "szavazokorid"] = nearest["szavazokorid"]
+            out.at[idx, "color"] = nearest["color"]
+
+        break
 
     return out
 
@@ -280,53 +339,107 @@ def ures_polyk_besorolasa(results):
 
 
 
-def polygonok_egyesitese(results, *, max_parts = 1, start_tol = 0.1, grow_factor = 2, max_tol = 50):
+def _split_pinch_point_preserving_holes(poly):
+    """Figura-8 (self-touching) Polygon szétbontása külön polygonokra,
+    a belső gyűrűket (lyukakat) visszaillesztve a megfelelő külső részbe."""
+    if poly.exterior.is_simple:
+        return poly
+    outer_parts = list(polygonize(poly.exterior))
+    if not outer_parts:
+        return poly
+    interiors = list(poly.interiors)
+    if not interiors:
+        return outer_parts[0] if len(outer_parts) == 1 else MultiPolygon(outer_parts)
+    result = []
+    for op in outer_parts:
+        holes = [list(ring.coords) for ring in interiors if op.contains(Polygon(ring))]
+        result.append(Polygon(list(op.exterior.coords), holes))
+    return result[0] if len(result) == 1 else MultiPolygon(result)
+
+
+def _clean_polygonal(geom):
+    """Biztosítja, hogy a geom tiszta Polygon/MultiPolygon — nincsenek
+    LineString komponensek (lógó vonal), nincs figura-8."""
+    if geom is None or geom.is_empty:
+        return None
+
+    # GeometryCollection: csak a polygonális részeket tartjuk meg
+    if geom.geom_type == "GeometryCollection":
+        parts = []
+        for g in geom.geoms:
+            if g.geom_type == "Polygon":
+                parts.append(g)
+            elif g.geom_type == "MultiPolygon":
+                parts.extend(list(g.geoms))
+        if not parts:
+            return None
+        geom = parts[0] if len(parts) == 1 else MultiPolygon(parts)
+
+    if geom.geom_type == "Polygon":
+        return _split_pinch_point_preserving_holes(geom)
+
+    if geom.geom_type == "MultiPolygon":
+        pieces = []
+        for p in geom.geoms:
+            c = _split_pinch_point_preserving_holes(p)
+            if c is None or c.is_empty:
+                continue
+            if c.geom_type == "MultiPolygon":
+                pieces.extend(list(c.geoms))
+            else:
+                pieces.append(c)
+        if not pieces:
+            return None
+        return pieces[0] if len(pieces) == 1 else MultiPolygon(pieces)
+
+    return None
+
+
+def polygonok_egyesitese(results, *, max_parts=1, **_ignored):
     '''
-    Szavazókörönként egyetlen *Polygon*-t kényszerít ki úgy, hogy a különálló részeket
-    toleranciás "ragasztással" összeköti (buffer+/-).
+    Szavazókörönkénti unió.
 
-    - start_tol: kezdő ragasztási távolság (CRS egységben, EOV -> méter)
-    - grow_factor: ha még mindig több part, ennyivel szorozzuk a tol-t
-    - max_tol: biztonsági plafon, nehogy elszálljon
+    Minden cella az `egyesites()` + `felez()` után 1cm rácson van → élben
+    érintkező szomszédos cellák pontosan osztoznak csúcsokon. A unió
+    előtt set_precision-nel újra szinkronizálunk a biztonság kedvéért.
 
-    FIGYELEM: ez torzít (hidakat képez), de cserébe 1 Polygon lesz.
+    - unary_union szavazókörönként
+    - make_valid (figura-8 splitting, érvényes topológia)
+    - GeometryCollection / LineString komponens szűrés (nincs lógó vonal)
+    - Pinch-point külső gyűrűn: szétbontás lyuk-megőrzéssel
+    - Lyukak (másik szavazókör cellái által elfoglalt belső terület)
+      érintetlenül maradnak — átfedés kizárt
     '''
-
     out_rows = []
 
     for szkid, grp in results.groupby("szavazokorid", dropna=False):
         color = grp["color"].iloc[0] if "color" in grp.columns else None
 
-        geom = unary_union(list(grp.geometry))
-        tol = start_tol
+        geoms = []
+        for g in grp.geometry:
+            if g is None or g.is_empty:
+                continue
+            g = set_precision(g, grid_size=0.01)
+            if g is None or g.is_empty:
+                continue
+            if g.geom_type not in ("Polygon", "MultiPolygon"):
+                continue
+            geoms.append(g)
 
-        # addig "ragasztunk", amíg el nem érjük a kívánt parts számot (1)
-        while True:
-            if geom.geom_type == "Polygon":
-                break
+        if not geoms:
+            continue
 
-            if geom.geom_type == "MultiPolygon":
-                parts = len(geom.geoms)
-                if parts <= max_parts:
-                    break
-            else:
-                # ha valami más (ritka), kilépünk
-                break
+        geom = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+        geom = make_valid(geom)
+        geom = _clean_polygonal(geom)
 
-            if tol > max_tol:
-                # nem sikerült 1 poligonná kényszeríteni a plafonon belül
-                break
+        if geom is None or geom.is_empty:
+            continue
 
-            # closing: növeszt -> összeragad -> visszahúz
-            geom = geom.buffer(tol).buffer(-tol)
-            tol *= grow_factor
-
-        # Ha még mindig MultiPolygon, itt dönthetsz: hagyod MultiPolygonként (1 geometria),
-        # vagy kényszeríted burkolóval (convex hull). Most: visszaadjuk, ami lett.
         out_rows.append({
             "szavazokorid": szkid,
             "color": color,
-            "geometry": geom
+            "geometry": geom,
         })
 
     return gpd.GeoDataFrame(out_rows, geometry="geometry", crs=results.crs)
