@@ -36,10 +36,101 @@ def add_color_to_gdf(gdf):
     return gdf
 
 
-def pontok_polygonban(gdf, gdf_szigetek, max_depth=25):
+def meret_alapu_felosztas(polygons_gdf, HOSSZ_LIMIT=400.0, MIN_TER=25000.0, max_depth=25):
+    '''
+    Oriented bbox alapú rekurzív felezés:
+    - area < MIN_TER: kész
+    - hosszú oldal > HOSSZ_LIMIT (2.1): merőleges vágás a hosszú tengelyre (hosszt felezi)
+    - egyébként (2.2): párhuzamos vágás a hosszú tengellyel (szélességet felezi)
+    '''
+
+    rows = []
+    stack = []
+
+    for _, row in polygons_gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        if geom.geom_type == "MultiPolygon":
+            for g in geom.geoms:
+                stack.append((g, 0))
+        elif geom.geom_type == "Polygon":
+            stack.append((geom, 0))
+
+    while stack:
+        poly, depth = stack.pop()
+
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            continue
+
+        if poly.area < MIN_TER or depth >= max_depth:
+            rows.append({"geometry": poly})
+            continue
+
+        try:
+            mrr = poly.minimum_rotated_rectangle
+            mrr_coords = list(mrr.exterior.coords)[:4]
+        except Exception:
+            rows.append({"geometry": poly})
+            continue
+
+        if len(mrr_coords) < 4:
+            rows.append({"geometry": poly})
+            continue
+
+        e01_len = ((mrr_coords[0][0] - mrr_coords[1][0]) ** 2 + (mrr_coords[0][1] - mrr_coords[1][1]) ** 2) ** 0.5
+        e12_len = ((mrr_coords[1][0] - mrr_coords[2][0]) ** 2 + (mrr_coords[1][1] - mrr_coords[2][1]) ** 2) ** 0.5
+
+        if e01_len >= e12_len:
+            long_edge = (mrr_coords[0], mrr_coords[1])
+            hossz = e01_len
+        else:
+            long_edge = (mrr_coords[1], mrr_coords[2])
+            hossz = e12_len
+
+        lx = long_edge[1][0] - long_edge[0][0]
+        ly = long_edge[1][1] - long_edge[0][1]
+        ln = (lx * lx + ly * ly) ** 0.5
+        if ln == 0:
+            rows.append({"geometry": poly})
+            continue
+
+        ux, uy = lx / ln, ly / ln
+        px, py = -uy, ux
+
+        cx, cy = poly.centroid.x, poly.centroid.y
+        ext = max(e01_len, e12_len) * 2 + 10
+
+        if hossz > HOSSZ_LIMIT:
+            vago = LineString([(cx - px * ext, cy - py * ext), (cx + px * ext, cy + py * ext)])
+        else:
+            vago = LineString([(cx - ux * ext, cy - uy * ext), (cx + ux * ext, cy + uy * ext)])
+
+        try:
+            result = split(poly, vago)
+            parts = [make_valid(g) for g in result.geoms if g.geom_type == "Polygon" and not g.is_empty]
+        except Exception:
+            parts = []
+
+        if len(parts) < 2:
+            rows.append({"geometry": poly})
+            continue
+
+        for g in parts:
+            if g.geom_type == "MultiPolygon":
+                for gg in g.geoms:
+                    stack.append((gg, depth + 1))
+            elif g.geom_type == "Polygon":
+                stack.append((g, depth + 1))
+
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=polygons_gdf.crs)
+
+
+def pontok_polygonban(gdf, gdf_szigetek, max_depth=3, skip_felezes=False):
     '''
     Végigmegy minden poligonon, megkeresi a pontokat, és:
       - ha több szavazókör van egy poligonon belül -> rekurzív felezés
+          (skip_felezes=True esetén: többségi szavazókör kap hozzárendelést, nem bontjuk)
       - ha egyetlen szavazókör van -> results sorba menti
     '''
 
@@ -63,7 +154,15 @@ def pontok_polygonban(gdf, gdf_szigetek, max_depth=25):
         unique_szavazokorok = points_inside["szavazokorid"].dropna().unique()
 
         if len(unique_szavazokorok) != 1:
-            rows.extend(polygon_tobb_szavazokor(polygon_geom, points_inside, max_depth=max_depth))
+            if skip_felezes:
+                counts = points_inside["szavazokorid"].dropna().value_counts()
+                winner = counts.index[0]
+                winner_color = points_inside.loc[
+                    points_inside["szavazokorid"] == winner, "color"
+                ].iloc[0]
+                rows.append({"szavazokorid": winner, "color": winner_color, "geometry": polygon_geom})
+            else:
+                rows.extend(polygon_tobb_szavazokor(polygon_geom, points_inside, max_depth=max_depth))
             continue
 
         rows.append({
@@ -138,41 +237,54 @@ def polygon_tobb_szavazokor(polygon_geom, points_inside, max_depth=25):
 def ures_polyk_besorolasa(results):
     """
     Azokat a sorokat kezeli, ahol szavazokorid hiányzik (NaN/None):
-      - megkeresi a szomszédos poligonokat (touches: közös határ/pont érintés)
-      - a szomszédok szavazokorid-jai közül a leggyakoribbat választja
+      - megkeresi a közös éllel érintkező, már címkézett szomszédokat
+      - a leggyakoribb szavazokorid-val tölti fel
+    Több menetben iterál — egymás mellett lévő üres poligonok láncát is feltölti,
+    amíg egyik sem marad besorolatlan (vagy elszigetelt).
     """
 
     out = results.copy()
     sindex = out.sindex
 
-    missing_idxs = out.index[out["szavazokorid"].isna()].tolist()
+    while True:
+        missing_idxs = out.index[out["szavazokorid"].isna()].tolist()
+        if not missing_idxs:
+            break
 
-    for idx in missing_idxs:
-        geom = out.at[idx, "geometry"]
+        filled_this_round = 0
+        for idx in missing_idxs:
+            geom = out.at[idx, "geometry"]
 
-        # touches() sarokponton érintkező szomszédot is elfogad → figura-8 union → gap/overlap
-        # Csak azok a szomszédok kellenek, amelyekkel közös ÉL van (hossz > 0)
-        candidate_idxs = list(sindex.intersection(geom.bounds))
-        candidates = out.loc[candidate_idxs]
+            candidate_idxs = list(sindex.intersection(geom.bounds))
+            candidates = out.loc[candidate_idxs]
 
-        neighbors_labeled = candidates[
-            candidates.geometry.apply(
-                lambda g: g.boundary.intersection(geom.boundary).length > 0.01
-            ) & candidates["szavazokorid"].notna()
-        ]
+            # Csak azok a szomszédok kellenek, amelyekkel közös ÉL van (hossz > 0),
+            # a pontérintkezés (figura-8) nem szomszédság.
+            neighbors_labeled = candidates[
+                candidates.geometry.apply(
+                    lambda g: g.boundary.intersection(geom.boundary).length > 0.01
+                ) & candidates["szavazokorid"].notna()
+            ]
 
-        if len(neighbors_labeled) == 0:
-            continue
+            if len(neighbors_labeled) == 0:
+                continue
 
-        counts = neighbors_labeled["szavazokorid"].value_counts()
-        winner_szavazokorid = counts.index[0]
+            counts = neighbors_labeled["szavazokorid"].value_counts()
+            winner_szavazokorid = counts.index[0]
 
-        winner_color = neighbors_labeled.loc[
-            neighbors_labeled["szavazokorid"] == winner_szavazokorid, "color"
-        ].iloc[0]
+            winner_color = neighbors_labeled.loc[
+                neighbors_labeled["szavazokorid"] == winner_szavazokorid, "color"
+            ].iloc[0]
 
-        out.at[idx, "szavazokorid"] = winner_szavazokorid
-        out.at[idx, "color"] = winner_color
+            out.at[idx, "szavazokorid"] = winner_szavazokorid
+            out.at[idx, "color"] = winner_color
+            filled_this_round += 1
+
+        if filled_this_round == 0:
+            # egyik üres poligon sem talált címkézett szomszédot → elszigetelt
+            remaining = out["szavazokorid"].isna().sum()
+            print(f"[ures_polyk_besorolasa] {remaining} cella marad besorolatlanul (elszigetelt, nincs címkézett szomszéd)")
+            break
 
     return out
 
