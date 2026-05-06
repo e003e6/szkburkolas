@@ -115,14 +115,10 @@ f. `polygonok_egyesitese` – szavazókörönkénti összevonás:
 - `red_gen` — **vörös**: a lakott területi határ MINDEN csúcsában a szomszédos él folytatását a polygon BELSEJE felé sugárral vizsgálja (szög ≤ SHARP_MAX_ANGLE_DEG, probe contains); megáll az első utca/orange/blue/határ metszésnél. A kinyúló városrészek alapját vágja el, így nem képződnek elnyúló tüske-poligonok.
 
 #### 1.3. Vonalháló tisztítása (`kapcsolas`)
-- **Alapszabály**: a határvonal és az utcahálózat együtt **FROZEN** — egyetlen pontjuk sem mozdul el a tisztítás során. Csak a helper vonalak (red/blue/orange) snapelődnek hozzájuk és egymáshoz a `red > blue > orange` prioritás szerint. Az utcahálózat második a rangsorban a határ mögött, de éppúgy sérthetetlen; a határ-párhuzamos szűrés után a megmaradt utcák már tisztán egyediek (duplikáltság csak a helper vonalakban engedélyezett).
-- `szur_hatarral_parhuzamos`: a határ PARALLEL_TOL (15 m) bufferén belül teljesen fekvő **utcákat** törli (dupla-fal-sliver megelőzés). Az orange/blue/red szándékos határ-híd vonalak, ezeket nem szűri. A helper vonalakat cutterként használja: ha egy parallel utcát egy red/blue/orange keresztez, az utcát a keresztezési pontnál szétvágja, és a helper-horgonyos sub-szakaszt MEGTARTJA még ha a bufferen belül van is — így a helper sosem lóg a levegőben törölt utca-részlet miatt.
-- `endpoint_cluster_merge`: union-find-alapú végpont-klaszterezés ENDPOINT_TOL (10 m) távolságon belül. Tier 0 = FROZEN (határ + utcák) → egyetlen pontjuk sem mozdul. Mozgatható prioritás: `red > blue > orange` (magasabb prioritású helper pontja az anchor egymás között). Tranzitív klaszterben levő azonos-vonalbeli második végpont mozgatását átugorja (0-ra zsugorodás elleni védelem). A határ MINDEN csúcsát phantom tier-0 horgonyként hozzáadja — így ha egy blue vég a határ-szakasz belsejében landol és egy red ugyanannak a csúcsnak a közeléből indul, mindkettő a közös határ-csúcsra rögzül (nem kerül a közelbe-de-nem-pontosan helyzetbe).
-- `hierarchikus_snap`: csak a mozgatható helper-tiereket snapeli `shapely.snap` MERGE_TOL (3 m) toleranciával; minden tier a FROZEN + már-snapolt helperek unióján anchorodik. A FROZEN bemenet változatlanul megy tovább. Return: `(frozen_lines, movable_snapped)`.
-- `reanchor_touching_endpoints` *(új)*: a `shapely.snap` csak csúcs→csúcs snapol. Ha egy helper végpont egy másik helper szegmens-belsejében ült és annak vertexe elmozdult, a szegmens megdől → a pont lefloatol → dangle. Ez a függvény ENDPOINT_TOL (10 m) távolságon belül visszavetíti a lefloatolt **helper** végpontokat a legközelebbi másik vonalra (STRtree + `nearest_points`). A FROZEN geometriát soha nem módosítja.
-- `unify_close_endpoints` *(új, safety net)*: a fenti lépések után is előfordulhat, hogy két mozgatható helper végpont ENDPOINT_TOL-on belül maradt külön koordinátán (tipikusan blue-blue, blue-orange, blue-red közeli-de-nem-azonos végek). Union-find klaszterezéssel egyetlen közös pontba olvasztja őket: ha van frozen-érintő tag (1e-6 táv), az lesz az anchor, különben a klaszter centroidja. A két-vég-egy-klaszter védelme a 0-ra zsugorodás ellen itt is érvényes.
-- `v_shape_fix` *(új)*: a közös végpontból induló vonalpárok közül a rövidebbet eltávolítja, ha a hosszabb V_TOL (3 m) távolságon belül fut a rövidebb MÁSIK végpontjától ÉS az a másik vég dangling (fokszám=1) — a snap-drift után maradt V-zászlókat szünteti meg, de terhelő (mindkét végén csatlakozó) szakaszokat érintetlenül hagy.
-- `set_precision 0.01`: 1 cm-es rácsra rögzíti a koordinátákat.
+- **Alapelv**: a helperek (red/blue/orange) a generálásban `ray.intersection(target)`-tel készülnek, tehát a végpontjuk PONTOSAN a célvonalon ül. `unary_union` önmagában elvégzi a rendes noding-ot (közös csúcs beszúrása a célvonalba), így **semmilyen generálás-utáni snap nem kell** — minden snap csak elmozdítaná a végpontot az exact találati pontról, és a helpert dangle-lé tenné.
+- `szur_hatarral_parhuzamos`: a határ PARALLEL_TOL (15 m) bufferén belül teljesen fekvő utcákat törli (dupla-fal-sliver megelőzés). A helper vonalakat cutterként használja: ha egy parallel utcát red/blue/orange keresztez, az utcát a keresztezési pontnál szétvágja, és a helper-horgonyos sub-szakaszt akkor is tartja, ha a bufferen belül van — így a helper sosem lóg a levegőben törölt utca-részlet miatt.
+- `unary_union` + `set_precision 0.01`: az összes vonalat (határ + szűrt utcák + red + blue + orange) egyetlen noding-lépésben rántja össze, 1 cm-es rácsra rögzítve.
+- `v_shape_fix`: a noded hálón a közös végpontból induló, közel-párhuzamos vonalpárok közül a rövidebbet eltávolítja, ha a hosszabb V_TOL (3 m) távolságon belül fut a rövidebb MÁSIK végpontjától ÉS az a másik vég dangling (fokszám=1). Csak valós V-zászlókat vág, terhelő szakaszokat nem.
 - **Dangle-loop**: iteratív dead-end-eltávolítás `polygonize_full` dangle-kimenete alapján, amíg nincs több (max 20 iteráció). Ezzel a `kapcsolas` tiszta, zárt hálót ad vissza — az `egyesites` csak poligont épít.
 
 #### 1.5. Poligonizálás (`egyesites`)
@@ -132,6 +128,54 @@ f. `polygonok_egyesitese` – szavazókörönkénti összevonás:
 ### 2–6. Szavazókörökhöz rendelés (`generalas_pipeline`)
 A V2 lépések változatlanok: `meret_alapu_felosztas` → `pontok_polygonban` → (`polygon_tobb_szavazokor`) → `ures_polyk_besorolasa` → `rebuild_coverage` → `polygonok_egyesitese`. Részletek a V2 szekcióban.
 
+**Egy-szavazóköri shortcut**: a `generalas_pipeline` a címjegyzék településre-szűrése után megnézi hány egyedi `szavazokorid` van. Ha pontosan 1, a teljes vonalháló-generálás (`poly_gen_pipeline`, `meret_alapu_felosztas`, `pontok_polygonban`, stb.) kimarad — csak a residential poligont kérjük le (`letoltes_csak_res`, útgráf nélkül), városhatárra vágjuk (`vag_residential_city`), és az unió lesz a szavazóköri poligon.
+
 ### 7. Export
 Ugyanaz mint a V2-nél: `.gpkg` QGIS-be.
+
+## Ismert OSM-hiba: üres drive-gráf kis településeknél
+
+`ox.graph_from_place(PLACE, network_type="drive")` aprófalvakra (pl. Ibafa) üres gráfot adhat vissza → az `ox.project_graph` ilyenkor `ValueError: Graph contains no edges`-szel elhasal. Lehetséges okok:
+- A Nominatim a falu nevére túl szűk vagy pont-alapú geocode-ot ad, nem olyan polygont amiben utcák vannak.
+- A `drive` network_type csak motorizált-járható highway-eket tart meg (`motorway…residential, living_street`); ha a falu utcái `highway=track` vagy `highway=service`, kiesnek.
+- A default `retain_all=False` eldobja a nem-összefüggő komponenseket.
+
+**Következmény**: a `letoltes` nem hívható vakon minden településre. Az egy-szavazóköri shortcut pont ezt kerüli el (csak residential + városhatár kell, útgráf nincs). Több-szavazóköri településnél, ha `letoltes` elhasal drive-gráf miatt, először érdemes ellenőrizni a tagging-et OSM-en, ne fallback-eljünk csendben más network_type-ra.
+
+**Kötelező invariáns**: ha egy településre nincs `landuse=residential` az OSM-ben (vagy a városhatáron belül nem marad), a függvény RuntimeError-rel **leáll**. SOHA nem esünk vissza a sima településhatárra helyettesítőként — ez akkor is igaz ha több szavazókör van a településen. A `letoltes` és `letoltes_csak_res` is explicit hibát dob ilyenkor.
+
+## Megoldandó probléma: `res_area_es_boundary` tangenciálisan ejti a diszjunkt lakott foltokat
+
+**Tünet**: Tab esetében a település 2 különálló `landuse=residential` poligonból áll. A futás után a második lakott egységhez *egyáltalán nem készült* poligon — sem a `2_utcak_hatarral` debug layerben (azaz nincs ott a határgyűrűje), sem a későbbi kimenetekben. Utcák viszont látszanak arrafelé az `1_utcak` layerben.
+
+**Gyökérok**: a `res_area_es_boundary` (`polygon_fuggvenyek.py:195`) szűrője:
+```python
+keep_polys = [p for p in polys if roads_union.intersection(p).length > 0]
+```
+Tab második foltjánál OSM-ben a `landuse=residential` polygon szorosan a beépített telkek köré van rajzolva, és az utcák a telekvonal MELLETT futnak (az utca *kihagyva*, a határ az utca mellé megy). Így `roads_union.intersection(p)` csak pontszerű tangenciális érintéseket ad → `length == 0` → a poligon kiesik a `keep_polys`-ból, nem kerül be a `res_area`-ba, nincs határgyűrű, a `polygonize` számára nem létezik.
+
+**Miért nem véletlen hiba**: ez a szűrő logikailag jogos céllal van ott (elhagyott, valóban úthálózat nélküli residential foltok kiszűrése), de a `length > 0` kritérium túl szigorú: egyetlen tangenciális érintés, vagy utca melletti (nem belsejében futó) rajzolás már kidobja a valódi lakott foltot is.
+
+**A fix lehetséges irányai** (nem eldöntve):
+- **Tolerált távolság**: `roads_union.distance(p) < TOL` (pl. 5–10 m) — érintkező és majdnem-érintkező utakat is elfogad.
+- **Node-alapú teszt**: legalább egy `nodes.geometry` pont essen a `p.buffer(TOL)`-ba.
+- **Hibrid**: `length > 0` **vagy** node-alapú feltétel.
+
+A node-alapú (vagy hibrid) feltétel azért vonzóbb, mint a puszta távolság, mert jobban ellenáll annak hogy egy vékony sliver (`vag_residential_city` határ-vágásból maradt forgács) mellett véletlenül fusson egy utca — node kell a polygon közelébe, nem csak él.
+
+**Mellékhatás amit figyelni kell**: ha a szűrőt lazítjuk, bekerülhetnek olyan kis OSM-ből ottfelejtett residential foltok, amikben tényleg nincs település. A `meret_alapu_felosztas` és a `pontok_polygonban` üres-cella kezelése (`ures_polyk_besorolasa`) ezeket elnyelné vagy üresként hagyná — érdemes ellenőrizni, mielőtt kiadjuk.
+
+## Nyitott kérdés: végleges kimeneti vetület (web-megjelenítéshez)
+
+**Kontextus**: a poligonokat később **webes térképen** fogjuk megjeleníteni, tehát a kimeneti CRS-t ehhez kell véglegesíteni. Jelenleg:
+- `osmnx.project_graph()` városonként lokális UTM-zónába vetít (Magyarországon EPSG:32633 vagy EPSG:32634, attól függően hogy a város nyugatra vagy keletre esik) → több várost batch-elve (`burkolas_multiple.py`) nem konkatenálható CRS-egyeztetés nélkül.
+- A `burkolas_multiple.py` jelenleg `EPSG:23700` (EOV) target CRS-re vetít. Ez Magyarország hivatalos metrikus vetülete, geometriailag helyes, DE **HD72 dátumon van**, így QGIS/webes megjelenítéskor a WGS84-alapú web-vetületekre (`EPSG:3857`, `EPSG:4326`) váltáskor dátum-transzformáció kell — QGIS ezért dob dialógust betöltéskor.
+
+**Mit kell eldönteni, mielőtt éles használatra kiadjuk**:
+1. **Tároljuk EOV-ban** (jelenleg ez van): geometriailag pontos, de minden web-export előtt kell egy `to_crs('EPSG:4326')` lépés, és figyelni kell a dátum-transzformáció helyes beállítására.
+2. **Tároljuk UTM 34N-ben** (`EPSG:32634`): WGS84 alapú → nincs dátumváltás, a 3857/4326-ra váltás tiszta. A zóna-33-ba eső nyugat-magyarországi települések szélén <0,1% torzulás — érdemi hatás nincs.
+3. **Tároljuk közvetlenül WGS84-ben** (`EPSG:4326`): web-ready, semmilyen konverzió nem kell exportkor. Hátrány: nem metrikus, ha utólag területet/puffert akarunk számolni a kimeneten, át kell vetíteni.
+4. **Tároljuk 3857-ben**: közvetlen web-tile CRS, nulla konverzió. Hátrány: sarki/széli torzulás, nem metrikus.
+
+**Ajánlott irány** (nem eldöntve): a pipeline belsejében maradjon a metrikus számítás (UTM vagy EOV), de a `burkolas_multiple.py` végső egyesített kimenetét célszerű `EPSG:4326`-ra írni — ez a de facto web-szabvány, minden leaflet/mapbox/maplibre közvetlenül eszi. Döntés előtt tisztázandó: a web-frontend milyen formátumot vár (GeoJSON? Vector tile? MVT?), és kell-e metrikus attribútum (pl. terület m²-ben) a kimenetben.
 
