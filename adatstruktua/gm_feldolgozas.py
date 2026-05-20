@@ -1,9 +1,12 @@
-import json
-import os
-import random
 import pandas as pd
+import geopandas as gpd
+import os
+import json
+from shapely.geometry import Point
+from utca_nev_norm import *
 
 
+# jsonl olvasó függvény
 class JsonlWriter:
     def __init__(self, path):
         self.path = path
@@ -22,7 +25,6 @@ class JsonlWriter:
             return []
         with open(self.path, "r", encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
-
 
 
 def jsonl_load(path):
@@ -113,3 +115,45 @@ def jsonl_load(path):
 
     return df
 
+
+
+def gm_feldolgozas(jsonl_path='../data/nyers_data/orszagos_teljes_ms_google.jsonl'):
+
+    # 1. google maps lekérdezések beolvasása
+    df = jsonl_load(jsonl_path)
+
+
+    # 2. címek alapján utca név és házszám szétválasztása
+
+    # tisztítás előtte
+    tmp = df["cim"].str.strip()
+
+    # szétválsztás regex
+    df[["utca", "cim"]] = tmp.str.extract(r"^(.*?)(\d.*)$", expand=True)
+
+    # tisztítás utánna
+    df["utca"] = df["utca"].str.strip()
+    df["cim"] = df["cim"].str.strip()
+
+    # oszlopok rendezése
+    df = df[['gid', 'utca', 'cim', 'telepules', 'iszam', 'orszag', 'lat', 'lon']]
+
+
+    # 3. közterület nevek egységesítése
+    df["utca"] = utca_normalizalas(df["utca"])
+
+
+    # 4. házszámok egységesítése
+    df = cim_standardizalas(df)
+
+    print('Google maps lekérdezés adatok standardizálva')
+
+
+    # 5. geoDataFrame létrehozása a kordinátákkal
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326")
+    gdf = gdf.drop(columns=["lat", "lon"])
+
+    # exportálás
+    #gdf.to_file('../../adatok/working/orszagos_valid_kordinatak.gpkg', layer='network_polygons', driver='GPKG')
+    
+    gdf.to_parquet('../data/work_data/teljes_ms_google_tisztott.parquet')
