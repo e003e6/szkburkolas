@@ -4,8 +4,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
-from osmnx._errors import InsufficientResponseError
-
 from shapely.ops import unary_union, linemerge, polygonize, polygonize_full, split as shp_split
 from shapely import make_valid, set_precision
 from shapely.geometry import LineString, Polygon, MultiPolygon, Point, GeometryCollection
@@ -78,90 +76,6 @@ def clip_lines(lines, poly):
         cut = ln.intersection(poly)
         out.extend(extract_lines(cut))
     return [g for g in out if g is not None and not g.is_empty]
-
-
-def letoltes(PLACE):
-    '''
-    Letöltés és projektálás (úthálózat, lakott terület poligonok, hivatalos városhatár)
-    '''
-
-    # strukturált Nominatim-query: city= illeszkedik minden településszintű OSM objektumra
-    # (város/falu/hamlet), és country= kizárja a névütközést külföldi egységekkel.
-    # Ezzel elkerüljük, hogy pl. "Tab" a Tabi járásra (admin_level=7) mutasson.
-    query = {"city": PLACE, "country": "Hungary"} if isinstance(PLACE, str) else PLACE
-
-    G = ox.graph_from_place(query, network_type="drive")
-    Gp = ox.project_graph(G)
-    nodes, edges = ox.graph_to_gdfs(Gp, nodes=True, edges=True)
-
-    try:
-        res = ox.features_from_place(query, tags={"landuse": "residential"})
-    except InsufficientResponseError:
-        raise NincsResidentialError(f"Nincs landuse=residential poligon ehhez a PLACE-hez az OSM-ben: {PLACE}")
-    res = res[res.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
-
-    if res.empty:
-        raise NincsResidentialError(f"Nincs landuse=residential poligon ehhez a PLACE-hez az OSM-ben: {PLACE}")
-
-    res_p = res.to_crs(nodes.crs)
-
-    place_gdf = ox.geocode_to_gdf(query)
-
-    if place_gdf.empty:
-        raise RuntimeError("Nem lehet lekérni a hivatalos határt (geocode_to_gdf üres)")
-
-    city_geom = _safe_make_valid(place_gdf.geometry.iloc[0])
-
-    if city_geom is None or city_geom.is_empty:
-        raise RuntimeError("A lekért városhatár geometria üres/hibás")
-
-    city_boundary = gpd.GeoSeries([city_geom], crs=place_gdf.crs).to_crs(nodes.crs).iloc[0]
-    city_boundary = _safe_make_valid(city_boundary)
-
-    if city_boundary is None or city_boundary.is_empty:
-        raise RuntimeError("A városhatár projekció után üres/hibás lett.")
-
-    return Gp, nodes, edges, res_p, city_boundary
-
-
-def letoltes_csak_res(PLACE):
-    '''
-    Könnyített letöltés: CSAK a residential poligonokat és a hivatalos városhatárt.
-    Útgráf NEM tölt le — egy-szavazóköri településeknél használjuk, ahol a szavazóköri
-    poligon a teljes lakott terület. Ha nincs residential az OSM-ben, RuntimeError-rel
-    leáll (soha nem esünk vissza a sima településhatárra).
-    '''
-
-    query = {"city": PLACE, "country": "Hungary"} if isinstance(PLACE, str) else PLACE
-
-    try:
-        res = ox.features_from_place(query, tags={"landuse": "residential"})
-    except InsufficientResponseError:
-        raise NincsResidentialError(f"Nincs landuse=residential poligon ehhez a PLACE-hez az OSM-ben: {PLACE}")
-    res = res[res.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
-
-    if res.empty:
-        raise NincsResidentialError(f"Nincs landuse=residential poligon ehhez a PLACE-hez az OSM-ben: {PLACE}")
-
-    res_p = ox.projection.project_gdf(res)
-
-    place_gdf = ox.geocode_to_gdf(query)
-
-    if place_gdf.empty:
-        raise RuntimeError(f"Nem lehet lekérni a hivatalos határt (geocode_to_gdf üres): {PLACE}")
-
-    city_geom = _safe_make_valid(place_gdf.geometry.iloc[0])
-
-    if city_geom is None or city_geom.is_empty:
-        raise RuntimeError(f"A lekért városhatár geometria üres/hibás: {PLACE}")
-
-    city_boundary = gpd.GeoSeries([city_geom], crs=place_gdf.crs).to_crs(res_p.crs).iloc[0]
-    city_boundary = _safe_make_valid(city_boundary)
-
-    if city_boundary is None or city_boundary.is_empty:
-        raise RuntimeError(f"A városhatár projekció után üres/hibás lett: {PLACE}")
-
-    return res_p, city_boundary
 
 
 def vag_residential_city(res_p, city_boundary):

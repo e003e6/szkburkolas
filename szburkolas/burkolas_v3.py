@@ -4,21 +4,23 @@ import matplotlib.pyplot as plt
 
 from polygon_fuggvenyek import *
 from poligon_szk_fuggvenyek import *
+from polygon_io import olvas_varos
 
 
 def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.1, debug_path=None):
 
     # 1. poligonok létrehozása
 
-    # letöltöm a szükséges adatokat osm-ről ()
-    Gp, nodes, edges, res_p, city_boundary = letoltes(VAROS)
+    # OSM cache-ből (data/nyers_data/) — a tényleges letöltés az adatstruktua/osm_letoltes.py
+    Gp, nodes, edges, res_p, city_boundary = olvas_varos(VAROS, csak_lakott=False)
     res_cut = vag_residential_city(res_p, city_boundary)
     res_area, boundary, bypass_polys = res_area_es_boundary(res_cut, edges)
 
     if res_area is not None:
         orange = orange_gen(Gp, nodes, edges, MAX_EXT=MAX_EXT, EPS=EPS, MIN_SEG=MIN_SEG)
         blue = blue_gen(Gp, nodes, boundary, DIST_LIM=DIST_LIM, MIN_SEG=MIN_SEG)
-        red = red_gen(res_area, edges, orange, blue, MIN_SEG=MIN_SEG)
+        # red = red_gen(res_area, edges, orange, blue, MIN_SEG=MIN_SEG)  # ideiglenesen kihagyva — több zajt csinált mint hasznot
+        red = gpd.GeoSeries([], crs=edges.crs)
 
         network_gs_proj = kapcsolas(edges, orange, blue, red, res_area)
 
@@ -74,7 +76,7 @@ def generalas_pipeline(VAROS, debug=False, export=True):
     debug_path = f"./adatok/{VAROS}_debug_halozat.gpkg" if debug else None
 
     # beolvasom az összekapcsolt pontok df-et
-    gdf = gpd.read_file('./adatok/osszekapcsolt_pontok_es_cimek.gpkg')
+    gdf = gpd.read_file('../data/work_data/osszekapcsolt_pontok_es_cimek_v2.gpkg')
 
     # szűröm városra és választásra
     gdf = gdf.query('telepules == @VAROS')
@@ -93,7 +95,7 @@ def generalas_pipeline(VAROS, debug=False, export=True):
     if gdf["szavazokorid"].nunique() == 1:
         # csak residential + városhatár — útgráf-lekérdezés kimarad
         try:
-            res_p, city_boundary = letoltes_csak_res(VAROS)
+            res_p, city_boundary = olvas_varos(VAROS, csak_lakott=True)
         except NincsResidentialError as e:
             print(f"[{VAROS}] {e} — kihagyom.")
             return None, None
@@ -109,7 +111,7 @@ def generalas_pipeline(VAROS, debug=False, export=True):
         )
 
         if export:
-            merged.to_file(f'./adatok/{VAROS}_szigetek_besorolt_3.gpkg', layer='network_polygons', driver='GPKG')
+            merged.to_file(f'./adatok/{VAROS}_szigetek_besorolt_4.gpkg', layer='network_polygons', driver='GPKG')
             gdf.to_file(f'./adatok/{VAROS}_cimek_besorolt.gpkg', layer='network_polygons', driver='GPKG')
 
         return gdf, merged
@@ -150,6 +152,6 @@ def generalas_pipeline(VAROS, debug=False, export=True):
 
 
 if __name__ == "__main__":
-    VAROS = 'Kétvölgy'
+    VAROS = 'Tököl'       # Kétvölgy
 
     gdf, gdf_szigetek = generalas_pipeline(VAROS, debug=True)

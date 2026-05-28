@@ -5,5 +5,8 @@
 **/jupvenv/
 **/cache/
 **/adatok/
+**/data/
 **/__pycache__/
 **/ksh_adatok/
+**/mindenmas/
+**/munkafajlok/

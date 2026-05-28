@@ -175,16 +175,19 @@ def overpass_feldolgozas():
     osm.to_parquet('../data/work_data/osm_cim_kordinata.parquet')
 
 
-    # Hiányzó házszámú épület-poligonok
+    # Üres (cím nélküli) épület-poligonok
 
-    # csak azok az épület-poligonok, amelyekben nincs házszám megadva
-    # (a fenti loopban már elmentett `epuletek_poligonok` változót használjuk)
-    hn = epuletek_poligonok['addr:housenumber']
-    mask = hn.isna() | (hn.astype(str).str.strip() == '')
+    # Üres = NINCS housenumber ÉS NINCS place ÉS NINCS conscriptionnumber.
+    # Az `epuletek_poligonok` pont a (housenumber | place | conscriptionnumber)
+    # valamelyikével rendelkező épületeket tartalmazza, így a teljes,
+    # szűretlen halmazból (`epuletek_poligonok_osszes`) ezeket kivonva
+    # maradnak a semmilyen címmel nem rendelkező poligonok.
+    cimes_idk = set(epuletek_poligonok['id'])
+    epuletek_hianyos = epuletek_poligonok_osszes[
+        ~epuletek_poligonok_osszes['id'].isin(cimes_idk)
+    ].reset_index(drop=True)
 
-    epuletek_hianyos = epuletek_poligonok[mask].reset_index(drop=True)
-
-    print(f"Hiányzó házszámú épület-poligonok: {len(epuletek_hianyos)} db")
+    print(f"Cím nélküli épület-poligonok: {len(epuletek_hianyos)} db")
 
     # csak azok a hiányos poligonok maradnak, amikbe nem esik bele egyetlen címes osm pont sem
     # (a `osm` GeoDataFrame minden eleme címes — pontok + épület-centroidok házszámmal)

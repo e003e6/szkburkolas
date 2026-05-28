@@ -1,4 +1,5 @@
 import traceback
+from pathlib import Path
 
 import pandas as pd
 import geopandas as gpd
@@ -6,15 +7,12 @@ import geopandas as gpd
 from burkolas_v3 import generalas_pipeline
 
 
-
-gdf = gpd.read_file('./adatok/osszekapcsolt_pontok_es_cimek.gpkg')
-
-VAROSOK = gdf['telepules'].unique().tolist()
-# VAROSOK = [
-#     'Enying',
-#     'Ibafa',
-#     'Csebény',
-# ]
+# A városlista forrása: data/nyers_data/varosok.txt — adatstruktua/varosok_kiir.py írja ki
+# az osszekapcsolt_pontok_es_cimek.gpkg-ből. Egy név per sor, ABC sorrendben.
+# Ugyanezt használja az adatstruktua/osm_letoltes.py is, így a cache és a batch
+# garantáltan ugyanazon a város-halmazon dolgozik.
+VAROSOK_TXT = Path(__file__).resolve().parent.parent / 'data' / 'nyers_data' / 'varosok.txt'
+VAROSOK = [v.strip() for v in VAROSOK_TXT.read_text(encoding='utf-8').splitlines() if v.strip()]
 
 OUTPUT = './adatok/osszesitett.gpkg'
 TARGET_CRS = 'EPSG:23700'  # EOV — Magyarországra egységes metrikus vetület

@@ -33,10 +33,10 @@ def gm_osm_lekerdezes():
     # [lat, lon] lista — ugyanaz a formátum mint ms_building_feldolgozas
     kozeppont_lista = list(zip(centroidok.y, centroidok.x))
 
-    with open("../data/out_data/lekerdezendo_kordinatak_maradek.json", "w", encoding="utf-8") as f:
+    with open("../data/out_data/lekerdezendo_kordinatak_osm_epulet.json", "w", encoding="utf-8") as f:
         json.dump(kozeppont_lista, f, ensure_ascii=False, indent=4)
 
-    print(f"Exportálva: ../data/out_data/lekerdezendo_kordinatak_osm.json ({len(kozeppont_lista)} koordináta)")
+    print(f"Exportálva: ../data/out_data/lekerdezendo_kordinatak_osm_epulet.json ({len(kozeppont_lista)} koordináta)")
 
 
 if __name__ == '__main__':

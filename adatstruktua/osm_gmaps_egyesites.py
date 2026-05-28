@@ -7,6 +7,12 @@ import pandas as pd
 import geopandas as gpd
 
 
+# Geometriai duplikátum-küszöb: ha egy gmaps pont ennél közelebb van bármely OSM
+# ponthoz, ugyanannak a fizikai címnek tekintjük → az OSM változat nyer.
+# (Tipikusan a Google Maps néha rossz postcode-ot ad, az OSM postcode pontosabb.)
+GEOM_DEDUP_M = 5.0
+
+
 def osm_gmaps_egyesites():
 
     osm = gpd.read_parquet('../data/work_data/osm_cim_kordinata.parquet')
@@ -22,7 +28,7 @@ def osm_gmaps_egyesites():
 
     # id oszlopok törlése (egy közös id lesz majd)
     osm = osm.drop(columns=["id"])
-    gmaps = gmaps.drop(columns=["gid"])
+    gmaps = gmaps.drop(columns=["gid", "forras"])
 
     # oszlopok közös névre hozása
     gmaps = gmaps.rename(columns={
@@ -57,6 +63,17 @@ def osm_gmaps_egyesites():
     osm_keys = set(osm["_key"])
     gmaps_new = gmaps[~gmaps["_key"].isin(osm_keys)].copy()
     print("gmaps eredeti:", len(gmaps), "| duplikátumok OSM-mel:", len(gmaps) - len(gmaps_new))
+
+    # Geometriai duplikátum-szűrés: ugyanaz a fizikai cím szerepelhet eltérő postcode-dal
+    # OSM-ben és gmaps-ben (gmaps néha rossz postcode-ot ad). Ilyenkor OSM nyer.
+    osm_m = osm[["geometry"]].to_crs(23700)
+    gmaps_m = gmaps_new[["geometry"]].to_crs(23700)
+    nearest = gpd.sjoin_nearest(gmaps_m, osm_m, how="left",
+                                max_distance=GEOM_DEDUP_M, distance_col="_dist_m")
+    geom_dup_idx = nearest.loc[nearest["_dist_m"].notna()].index.unique()
+    print(f"gmaps geometriai duplikátum (≤{GEOM_DEDUP_M:.0f}m OSM ponthoz): {len(geom_dup_idx)} db")
+    gmaps_new = gmaps_new.loc[~gmaps_new.index.isin(geom_dup_idx)].copy()
+    print(f"gmaps megmaradó: {len(gmaps_new)}")
 
     # Egyesítés és takarítás
     merged = pd.concat([osm, gmaps_new], ignore_index=True)

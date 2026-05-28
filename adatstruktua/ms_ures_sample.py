@@ -1,227 +1,290 @@
-"""
-Microsoft Open Buildings adatrések detektálása Magyarországon — raszter-szintű
-csúsztatott-ablak módszerrel.
+'''
+A Mircroft Building adatbázisból szedem az épületeket amikhez lekérem a pontos címet
+így innen tudom hol van épület amihez le kell kérdeznem a címet,
+viszont az dataset néhány helyen hibás (felhők stb.) ezért ezekben a régiókban
+nem tud épületet felismerni így itt nincsenek lekérdezendő kordináták.
 
-Probléma: a Microsoft dataset chunk-jain BELÜL vannak nagy, várost méretű foltok
-ahol az ML-pipeline nem dolgozott fel sub-tile-okat. A Microsoft erről nem ad
-metaadatot. Detektálás: ahol OSM-ben jelen vannak épületek de MS-ben SEMMI sincs
-egy lokális környezetben → adatrés.
+A függvény ezt korigálja méghozzá két lépésben:
+    1. detektálom azokat a városokat ahol nincsen MS (Microsoft) adat,
+    ez mivel nincsen dokumenálva csak másidk datasettel összevetve tudom megtenni.
 
-Módszer (z=14 raszter + 3×3 csúsztatott ablak):
-  1. Minden OSM és MS épület-középpontot z=14 web-mercator cellába sorolunk
-     (~1.2–1.5 km cella Magyarország szélességén).
-  2. Két sűrű 2D számláló rácsot építünk: `osm_grid` és `ms_grid`.
-  3. Mindkét rácson (2r+1)×(2r+1) csúsztatott ablak-összeget veszünk → `osm_local`,
-     `ms_local`. r=1 mellett az ablak ~3.6–4.5 km.
-  4. Gap maszk: `osm_local >= OSM_LAKOTT_KUSZOB ÉS ms_local == 0`.
-     Az `ms_local == 0` feltétel a kulcs: az adott cella *környezetében* sincs
-     MS épület, nem csak a cellában — így a gap-régió határán fekvő apró falvak
-     is bekerülnek (a régi cella-szintű ms_n == 0 ezeket kihagyta, mert a 10 km-es
-     cella másik részén volt egy-két MS épület).
-  5. Magyarország-határ szűrés cella-középpont alapján.
-  6. 8-szomszédság komponens-címkézés (scipy.ndimage.label) → klaszterek.
+    2. azokat a városokat ahol nincsen MS adat azokba veszek fel véleteln kordinátákat,
+    vagyis mintavételemezem és ezeket a leszúrt kordinátákat kérdezem le.
+'''
 
-Nincs minimum-klaszter méretszűrés: minden gap-cella bekerül a kimenetbe.
-"""
-
+import json
 import os
-import numpy as np
-import pandas as pd
+
 import geopandas as gpd
-from shapely.geometry import box
+import numpy as np
+from shapely import make_valid
+from shapely.geometry import Point, box
 from shapely.ops import unary_union
-from scipy.ndimage import label  # 8-szomszédság komponens-címkézés
+from shapely.vectorized import contains as shp_contains
 
 
-# --- Bemenetek / kimenet ---------------------------------------------------
-MS_PARQUET  = "../data/work_data/ms_minden_epulet.parquet"
-OSM_PARQUET = "../data/work_data/osm_minden_epulet.parquet"
-HU_BORDER   = "../data/work_data/hungary_border.geojson"
-OUT_GPKG    = "../data/test_data/ms_adatresek.gpkg"
+LAKOTT_PARQUET  = "../data/nyers_data/varos_lakottterulet_hatar.parquet"
+ADMIN_PARQUET   = "../data/nyers_data/varos_kozigazgatasi_hatar.parquet"
+MS_PARQUET      = "../data/work_data/ms_minden_epulet.parquet"
+OUT_PARQUET     = "../data/work_data/ms_kihagyott_teruletek.parquet"
+OUT_GPKG        = "../data/test_data/ms_kihagyott_teruletek.gpkg"
+OUT_JSON        = "../data/out_data/lekerdezendo_kordinatak_kihagyott_teruletek.json"
+OUT_GPKG_PONTOK = "../data/test_data/lekerdezendo_kordinatak_kihagyott_teruletek.gpkg"
 
-# --- Hangolható konstansok -------------------------------------------------
-RACS_ZOOM         = 14       # web-mercator zoom (~1.2–1.5 km cella)
-ABLAK_SUGAR       = 1        # 3×3 csúsztatott ablak (2r+1 cella oldal); r=2 → 5×5
-OSM_LAKOTT_KUSZOB = 3        # min OSM épület az ablakban (nem cellában)
-METRIKUS_CRS_HU   = 23700    # EOV — területszámításhoz km²-ben
-
-
-# ---------------------------------------------------------------------------
-# Helper-ek — tile-matematika és sliding-window összeg
-# ---------------------------------------------------------------------------
-def _lonlat_to_tile(lon, lat, z=RACS_ZOOM):
-    """Vektorizált slippy-map tile-XY."""
-    lon = np.asarray(lon, dtype=np.float64)
-    lat = np.asarray(lat, dtype=np.float64)
-    n = 2.0 ** z
-    xtile = np.floor((lon + 180.0) / 360.0 * n).astype(np.int64)
-    ytile = np.floor((1.0 - np.arcsinh(np.tan(np.radians(lat))) / np.pi) / 2.0 * n).astype(np.int64)
-    xtile = np.clip(xtile, 0, int(n) - 1)
-    ytile = np.clip(ytile, 0, int(n) - 1)
-    return xtile, ytile
+EOV_CRS       = 23700    # EPSG:23700 — EOV, területszámítás és tengelyirányú vágások
+VAGAS_KUSZOB  = 0.10     # 10% — ettől tekintünk egy oldalt vágottnak
+BBOX_PUFFER_M = 1000.0   # félsík-kivágó téglalap puffere (méter, EOV-ban)
+SURUSEG_KM2   = 500     # mintavételi sűrűség: pont / km² (változtatható)
 
 
-def _tile_to_bounds(xtile, ytile, z=RACS_ZOOM):
-    """Egy tile bbox-a EPSG:4326-ban (lon_min, lat_min, lon_max, lat_max)."""
-    n = 2.0 ** z
-    lon_min = xtile / n * 360.0 - 180.0
-    lon_max = (xtile + 1) / n * 360.0 - 180.0
-    lat_max = np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * ytile / n))))
-    lat_min = np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (ytile + 1) / n))))
-    return float(lon_min), float(lat_min), float(lon_max), float(lat_max)
+def _safe_make_valid(g):
+    """A `szburkolas/polygon_fuggvenyek.py:_safe_make_valid` lokális másolata —
+    invalid geometriákat (önmetsző poligonok stb.) javít. A `vag_residential_city`
+    mindenhol ezt használja a metszés előtt és után, ezért nálunk is kell, hogy
+    a klippelés ne legyen érzékeny az OSM-ből jövő enyhén hibás geometriákra."""
+    if g is None or g.is_empty:
+        return g
+    try:
+        return make_valid(g)
+    except Exception:
+        try:
+            return g.buffer(0)
+        except Exception:
+            return g
 
 
-def _tile_centers(xtiles, ytiles, z=RACS_ZOOM):
-    """Vektorizált cella-középpontok EPSG:4326-ban (lon_c, lat_c)."""
-    xtiles = np.asarray(xtiles, dtype=np.float64)
-    ytiles = np.asarray(ytiles, dtype=np.float64)
-    n = 2.0 ** z
-    lon_c = (xtiles + 0.5) / n * 360.0 - 180.0
-    lat_c = np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (ytiles + 0.5) / n))))
-    return lon_c, lat_c
-
-
-def _box_sum(grid, r):
-    """
-    (2r+1)×(2r+1) csúsztatott ablak-összeg integrált-kép (cumsum) trükkel.
-    Nulla-padding a szélén → ugyanaz a shape mint `grid`.
-    Tisztán numpy, O(H·W).
-    """
-    h, w = grid.shape
-    cum = np.zeros((h + 1, w + 1), dtype=np.int64)
-    cum[1:, 1:] = grid.astype(np.int64).cumsum(0).cumsum(1)
-
-    i = np.arange(h)
-    j = np.arange(w)
-    i0 = np.maximum(i - r, 0)
-    i1 = np.minimum(i + r + 1, h)
-    j0 = np.maximum(j - r, 0)
-    j1 = np.minimum(j + r + 1, w)
-
-    return (cum[i1[:, None], j1[None, :]]
-            - cum[i0[:, None], j1[None, :]]
-            - cum[i1[:, None], j0[None, :]]
-            + cum[i0[:, None], j0[None, :]])
-
-
-# ---------------------------------------------------------------------------
-# Fő pipeline
-# ---------------------------------------------------------------------------
-def ms_ures_sample():
-    # 1) BEOLVASÁS
-    print("MS és OSM középpontok beolvasása...")
-    ms = gpd.read_parquet(MS_PARQUET)
-    # ms_building_feldolgozas.py már EPSG:4326-os centroidot ír a 'kozeppont' oszlopba;
-    # gpd.read_parquet ezt nem aktív geometriaként hozza vissza -> explicit GeoSeries.
-    ms_pts = gpd.GeoSeries(ms["kozeppont"], crs=4326)
-
-    osm = gpd.read_parquet(OSM_PARQUET)
-    if osm.crs is None:
-        osm = osm.set_crs(4326)
-    elif osm.crs.to_epsg() != 4326:
-        osm = osm.to_crs(4326)
-    osm_pts = osm.geometry.centroid
-
-    border = gpd.read_file(HU_BORDER).to_crs(4326)
-    border_geom = unary_union(border.geometry.values)
-
-    print(f"  MS pontok:  {len(ms_pts):,}")
-    print(f"  OSM pontok: {len(osm_pts):,}")
-
-    # 2) TILE XY mindkét pontfelhőre
-    ms_x,  ms_y  = _lonlat_to_tile(ms_pts.x.to_numpy(),  ms_pts.y.to_numpy())
-    osm_x, osm_y = _lonlat_to_tile(osm_pts.x.to_numpy(), osm_pts.y.to_numpy())
-
-    # 3) MAGYARORSZÁG BBOX TILE-KOORDINÁTÁKBAN — sűrű rácshoz korlátozzuk
-    lon_min, lat_min, lon_max, lat_max = border_geom.bounds
-    # tile-y délről nőj: lat_max → kicsi y, lat_min → nagy y
-    bx, by = _lonlat_to_tile(
-        np.array([lon_min, lon_max]),
-        np.array([lat_max, lat_min]),
-    )
-    x_min, x_max = int(bx.min()), int(bx.max())
-    y_min, y_max = int(by.min()), int(by.max())
-    # szegély-pad a sliding ablak miatt — a határszéli cellák ablaka ne csonkuljon
-    pad = ABLAK_SUGAR
-    x_min -= pad; x_max += pad
-    y_min -= pad; y_max += pad
-    W = x_max - x_min + 1
-    H = y_max - y_min + 1
-    print(f"  Rács bbox: {W} × {H} cella (z={RACS_ZOOM})")
-
-    # 4) SŰRŰ 2D SZÁMLÁLÓ RÁCSOK — bincount a (y,x) lineáris indexen
-    def _grid(xs, ys):
-        mask = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
-        xs2 = (xs[mask] - x_min).astype(np.int64)
-        ys2 = (ys[mask] - y_min).astype(np.int64)
-        flat = ys2 * W + xs2
-        return np.bincount(flat, minlength=H * W).reshape(H, W)
-
-    ms_grid  = _grid(ms_x,  ms_y)
-    osm_grid = _grid(osm_x, osm_y)
-
-    # 5) CSÚSZTATOTT ABLAK-ÖSSZEG
-    osm_local = _box_sum(osm_grid, ABLAK_SUGAR)
-    ms_local  = _box_sum(ms_grid,  ABLAK_SUGAR)
-
-    # 6) GAP MASZK — a kulcs feltétel: ms_local == 0 (NEM cellaszintű ms_n == 0)
-    gap_mask = (osm_local >= OSM_LAKOTT_KUSZOB) & (ms_local == 0)
-    print(f"  Gap-jelölt cella (sliding window): {int(gap_mask.sum()):,}")
-
-    # 7) MAGYARORSZÁG-HATÁR SZŰRÉS cella-középpont alapján
-    ys_idx, xs_idx = np.indices((H, W))
-    lon_c, lat_c = _tile_centers((xs_idx + x_min).ravel(), (ys_idx + y_min).ravel())
-    pts = gpd.GeoSeries(gpd.points_from_xy(lon_c, lat_c), crs=4326)
-    inside_mask = pts.within(border_geom).values.reshape(H, W)
-    gap_mask &= inside_mask
-    print(f"  Gap cella Magyarországon: {int(gap_mask.sum()):,}")
-
-    # 8) 8-SZOMSZÉDSÁG KOMPONENS-CÍMKÉZÉS — minden komponens marad, méret-szűrés NINCS
-    labels, n_comp = label(gap_mask, structure=np.ones((3, 3), dtype=int))
-    print(f"  Komponensek: {n_comp}")
-
-    # 9) CELLA-POLIGONOK ÉPÍTÉSE
-    gy_idx = np.where(gap_mask)
-    abs_x = gy_idx[1] + x_min
-    abs_y = gy_idx[0] + y_min
-    cell_boxes = [box(*_tile_to_bounds(int(abs_x[i]), int(abs_y[i])))
-                  for i in range(len(abs_x))]
-
-    gyanus_gdf = gpd.GeoDataFrame({
-        "tile_x":     abs_x.astype(np.int64),
-        "tile_y":     abs_y.astype(np.int64),
-        "osm_n":      osm_grid[gy_idx].astype(np.int64),    # csak ez a cella
-        "osm_window": osm_local[gy_idx].astype(np.int64),   # 3×3 ablakösszeg
-        "cluster_id": labels[gy_idx].astype(np.int64),
-    }, geometry=cell_boxes, crs=4326)
-
-    # 10) KOMPONENSENKÉNTI DISSOLVE — minden komponens kimegy (nincs min-cella szűrő)
-    rows = []
-    for cid, sub in gyanus_gdf.groupby("cluster_id", sort=True):
-        rows.append({
-            "cluster_id":  int(cid),
-            "cella_szam":  int(len(sub)),
-            "osm_n_total": int(sub["osm_n"].sum()),
-            "geometry":    unary_union(sub.geometry.values),
-        })
-    klaszterek = gpd.GeoDataFrame(rows, geometry="geometry", crs=4326)
-    if len(klaszterek) > 0:
-        klaszterek["terulet_km2"] = klaszterek.to_crs(METRIKUS_CRS_HU).area / 1_000_000.0
+def _szelet(poly, irany, ms_minx, ms_maxx, ms_miny, ms_maxy):
+    """A `poly` azon szelete, ami az MS-burkolódobozon KÍVÜL esik az adott irányban
+    (tengelyirányú félsík-metszet egy puffereit téglalappal)."""
+    pxmin, pymin, pxmax, pymax = poly.bounds
+    P = BBOX_PUFFER_M
+    if irany == "bal":
+        cutter = box(pxmin - P, pymin - P, ms_minx,   pymax + P)
+    elif irany == "jobb":
+        cutter = box(ms_maxx,   pymin - P, pxmax + P, pymax + P)
+    elif irany == "fent":
+        cutter = box(pxmin - P, ms_maxy,   pxmax + P, pymax + P)
+    elif irany == "lent":
+        cutter = box(pxmin - P, pymin - P, pxmax + P, ms_miny)
     else:
-        klaszterek["terulet_km2"] = pd.Series(dtype="float64")
-    klaszterek = klaszterek[["cluster_id", "cella_szam", "osm_n_total", "terulet_km2", "geometry"]]
+        raise ValueError(f"Ismeretlen irany: {irany}")
+    return poly.intersection(cutter)
 
-    # 11) EXPORT — két layer egy gpkg-ban
+
+def _vagott_arany(poly, irany, ms_minx, ms_maxx, ms_miny, ms_maxy):
+    """arany = ures_szelet.area / poly.area; üres metszet → 0.0."""
+    szelet = _szelet(poly, irany, ms_minx, ms_maxx, ms_miny, ms_maxy)
+    if szelet.is_empty:
+        return 0.0
+    return szelet.area / poly.area
+
+
+def varosok_detaktalasa():
+    # 1) lakott területi poligonok betöltése — EGY SOR = EGY landuse=residential poligon.
+    #    NEM dissolve-olunk telepules-szerint: ha egy városnak több külön lakott területe
+    #    van (központ + tanyák, vagy több, OSM-ben különálló településrész), a dissolve
+    #    egyetlen MultiPolygon-ná olvasztaná őket. Akkor a `total_bounds` az egész
+    #    MultiPolygon-on átfekvő MS-centroidok burkolódoboza lenne, és egy üres résztérség,
+    #    amit MS-rich részek vesznek körül, "belső lyukként" sosem esne ki egyetlen
+    #    tengelyirányú vágási szeletbe sem (minden arány < 10% → Eset C → némán kiesik).
+    #    Per-poligon iterációval minden üres poligon önállóan Eset A-ba kerül.
+    lakott = gpd.read_parquet(LAKOTT_PARQUET).to_crs(EOV_CRS).reset_index(drop=True)
+    print(f"Nyers lakott területi poligonok: {len(lakott)}")
+
+    # 1b) Klippelés a hivatalos közigazgatási határral — pontosan ugyanúgy, mint a
+    # `szburkolas/polygon_fuggvenyek.py::vag_residential_city` (make_valid → intersection
+    # → make_valid → típus-szűrés). Az OSM `landuse=residential` poligonokat az
+    # `osm_letoltes.py` városonként `features_from_place`-szel kérdezi, ami minden
+    # poligont visszaad ami METSZI a város határát — egy adminhatáron átlógó lakóterület
+    # a szomszéd város lekérdezésekor is visszajön. Klippelés nélkül a sjoin az átlógó
+    # részen lévő MS-centroidokat is hozzárendelné a vizsgált településhez.
+    admin = gpd.read_parquet(ADMIN_PARQUET).to_crs(EOV_CRS)
+    admin_lut = dict(zip(admin["telepules"], admin["geometry"]))
+    print(f"Admin határok: {len(admin)}")
+
+    klippelt = []
+    n_empty_g = n_no_admin = n_empty_inter = n_wrong_type = 0
+    for _, row in lakott.iterrows():
+        telepules = row["telepules"]
+        g = _safe_make_valid(row["geometry"])
+        if g is None or g.is_empty:
+            n_empty_g += 1
+            continue
+
+        a = admin_lut.get(telepules)
+        if a is None:
+            # nincs admin entry erre a városra (pl. geocode_to_gdf elhasalt) — eredeti
+            # geometriát tartjuk meg, hogy ne veszítsük el a várost az iterációból
+            n_no_admin += 1
+            inter = g
+        else:
+            a = _safe_make_valid(a)
+            try:
+                inter = g.intersection(a)
+            except Exception:
+                n_empty_inter += 1
+                continue
+            inter = _safe_make_valid(inter)
+            if inter is None or inter.is_empty:
+                n_empty_inter += 1
+                continue
+            if inter.geom_type not in ("Polygon", "MultiPolygon"):
+                # GeometryCollection / LineString tangenciális találat — kihagyjuk
+                n_wrong_type += 1
+                continue
+
+        klippelt.append({"telepules": telepules, "geometry": inter})
+
+    # explicit GeoDataFrame újraépítés — biztosítja hogy az aktív geometry oszlop
+    # és a CRS helyesen legyen beállítva a downstream sjoin-hoz
+    lakott = gpd.GeoDataFrame(klippelt, geometry="geometry", crs=EOV_CRS).reset_index(drop=True)
+    print(f"Klippelés után érvényes poligonok: {len(lakott)} "
+          f"(üres bemenet: {n_empty_g}, nincs admin: {n_no_admin}, "
+          f"üres metszet: {n_empty_inter}, rossz típus: {n_wrong_type})")
+
+    # 2) MS épületek — csak a középpontokkal dolgozunk (gyors, ~2 GB poligon helyett pontok)
+    ms_full = gpd.read_parquet(MS_PARQUET)
+    ms = gpd.GeoDataFrame(
+        ms_full[["id"]].copy(),
+        geometry=ms_full["kozeppont"],
+        crs=4326,
+    ).to_crs(EOV_CRS)
+    print(f"MS épület-középpontok száma: {len(ms)}")
+
+    # 3) melyik MS-centroid melyik LAKOTT POLIGON-ban van — per-poligon attribúció
+    joined = gpd.sjoin(
+        ms[["geometry"]],
+        lakott[["geometry"]],
+        how="inner",
+        predicate="within",
+    )
+    # index_right == lakott sor-indexe (reset_index után 0..N-1)
+    ms_per_poly = joined.groupby("index_right")
+    erintett_poly = set(ms_per_poly.groups.keys())
+
+    # 4) iteráció poligononként — vágás-teszt 4 irányból
+    rows = []
+    for idx, row in lakott.iterrows():
+        telepules = row["telepules"]
+        poly = row.geometry
+        if poly.is_empty or poly.area == 0:
+            continue
+
+        # === Eset A: nincs egyetlen MS-centroid sem ebben a poligonban ===
+        if idx not in erintett_poly:
+            rows.append({
+                "geometry":   poly,
+                "telepules":  telepules,
+                "eset":       "A_nincs_ms",
+                "arany_fent": 0.0, "arany_lent": 0.0,
+                "arany_bal":  0.0, "arany_jobb": 0.0,
+            })
+            continue
+
+        # === Eset B/C: van MS adat — 4 irányú vágás-teszt ===
+        ms_pts = ms_per_poly.get_group(idx)
+        minx, miny, maxx, maxy = ms_pts.total_bounds
+
+        aranyok = {
+            "bal":  _vagott_arany(poly, "bal",  minx, maxx, miny, maxy),
+            "jobb": _vagott_arany(poly, "jobb", minx, maxx, miny, maxy),
+            "fent": _vagott_arany(poly, "fent", minx, maxx, miny, maxy),
+            "lent": _vagott_arany(poly, "lent", minx, maxx, miny, maxy),
+        }
+
+        # stabil sorrend a címke-konzisztencia érdekében (fent, lent, bal, jobb)
+        vagott_iranyok = [ir for ir in ("fent", "lent", "bal", "jobb")
+                          if aranyok[ir] >= VAGAS_KUSZOB]
+        if not vagott_iranyok:
+            continue   # Eset C: nem vágott egy irányból sem
+
+        szeletek = [_szelet(poly, ir, minx, maxx, miny, maxy) for ir in vagott_iranyok]
+        ures = unary_union(szeletek)
+
+        rows.append({
+            "geometry":   ures,
+            "telepules":  telepules,
+            "eset":       "B_vagott_" + "_".join(vagott_iranyok),
+            "arany_fent": aranyok["fent"], "arany_lent": aranyok["lent"],
+            "arany_bal":  aranyok["bal"],  "arany_jobb": aranyok["jobb"],
+        })
+
+    # 5) mentés — vissza WGS84-re (storage konvenció), parquet + GPKG
+    out = gpd.GeoDataFrame(rows, crs=EOV_CRS, geometry="geometry").to_crs(4326)
+    print(f"Kihagyott területek: {len(out)} sor "
+          f"(A_nincs_ms: {(out['eset'] == 'A_nincs_ms').sum()}, "
+          f"B_vagott_*: {(out['eset'].str.startswith('B_')).sum()})")
+
+    os.makedirs(os.path.dirname(OUT_PARQUET), exist_ok=True)
+    out.to_parquet(OUT_PARQUET)
+
     os.makedirs(os.path.dirname(OUT_GPKG), exist_ok=True)
-    # GPKG layer-szinten append-elne újraíráskor; régi fájlt eldobjuk
-    if os.path.exists(OUT_GPKG):
-        os.remove(OUT_GPKG)
-    klaszterek.to_file(OUT_GPKG, driver="GPKG", layer="klaszterek")
-    gyanus_gdf.to_file(OUT_GPKG, driver="GPKG", layer="gyanus_cellak")
+    out.to_file(OUT_GPKG, driver="GPKG", layer="kihagyott")
 
-    print(f"Kész — {OUT_GPKG}")
-    print(f"  klaszterek:    {len(klaszterek)}")
-    print(f"  gyanus_cellak: {len(gyanus_gdf):,}")
+
+def mintavetelezes():
+    """Az összes kihagyott_teruletek poligonra (A_nincs_ms + B_vagott_*) véletlen
+    pontokat dob le `SURUSEG_KM2` pont/km² sűrűséggel — ez adja a Google Maps
+    geocoding bemenetét azokra a területekre, ahol nincs (vagy hiányos) az MS adat.
+
+    Rejection sampling a poligon bbox-án belül: bbox-ban generálunk uniform mintát,
+    `shapely.vectorized.contains` szűr a poligonra. A megengedettnél kb. kétszer annyi
+    próbálkozást generálunk körönként, hogy ritkán kelljen újra próbálkozni; aki
+    bbox-ra vetítve túl alacsony fedéssel rendelkezik (vékony szelet), az automatikusan
+    iterál még egy kört."""
+    teruletek = gpd.read_parquet(OUT_PARQUET).to_crs(EOV_CRS).reset_index(drop=True)
+    print(f"Mintavételezendő poligonok: {len(teruletek)} "
+          f"(össz. terület: {teruletek.area.sum() / 1e6:.2f} km²)")
+
+    rng = np.random.default_rng()
+    pontok = []
+    for _, row in teruletek.iterrows():
+        poly = row.geometry
+        if poly is None or poly.is_empty or poly.area == 0:
+            continue
+
+        N = max(1, int(round(poly.area / 1_000_000 * SURUSEG_KM2)))
+        minx, miny, maxx, maxy = poly.bounds
+        bevett = []
+        # rejection-loop: bbox→poly fedés alapján 2x annyit dobunk fel mint kell
+        while len(bevett) < N:
+            hianyzo = N - len(bevett)
+            xs = rng.uniform(minx, maxx, hianyzo * 2)
+            ys = rng.uniform(miny, maxy, hianyzo * 2)
+            bent = shp_contains(poly, xs, ys)
+            for x, y in zip(xs[bent], ys[bent]):
+                bevett.append((x, y))
+                if len(bevett) >= N:
+                    break
+
+        for x, y in bevett:
+            pontok.append({
+                "geometry":  Point(x, y),
+                "telepules": row["telepules"],
+                "eset":      row["eset"],
+            })
+
+    pgdf = gpd.GeoDataFrame(pontok, geometry="geometry", crs=EOV_CRS).to_crs(4326)
+    print(f"Mintavett pontok: {len(pgdf)}")
+
+    # JSON — Google Maps konvenció: [lat, lon] (ld. ms_building_feldolgozas.py:64-67)
+    kordinatak = list(zip(pgdf.geometry.y, pgdf.geometry.x))
+    os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
+    with open(OUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(kordinatak, f, ensure_ascii=False, indent=4)
+
+    # QGIS vizualizáció — hex color az eset szerint (A=piros, B_*=zöld)
+    pgdf["color"] = np.where(pgdf["eset"] == "A_nincs_ms", "#e41a1c", "#1b9e77")
+    os.makedirs(os.path.dirname(OUT_GPKG_PONTOK), exist_ok=True)
+    pgdf.to_file(OUT_GPKG_PONTOK, driver="GPKG", layer="pontok")
+
+
+
+def ms_ures_sample():
+
+    varosok_detaktalasa()
+
+    mintavetelezes()
 
 
 if __name__ == "__main__":
