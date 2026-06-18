@@ -17,12 +17,10 @@ def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.
     res_area, boundary, bypass_polys = res_area_es_boundary(res_cut, edges)
 
     if res_area is not None:
-        orange = orange_gen(Gp, nodes, edges, MAX_EXT=MAX_EXT, EPS=EPS, MIN_SEG=MIN_SEG)
+        orange = orange_gen(Gp, nodes, edges, boundary, MAX_EXT=MAX_EXT, EPS=EPS, MIN_SEG=MIN_SEG)
         blue = blue_gen(Gp, nodes, boundary, DIST_LIM=DIST_LIM, MIN_SEG=MIN_SEG)
-        # red = red_gen(res_area, edges, orange, blue, MIN_SEG=MIN_SEG)  # ideiglenesen kihagyva — több zajt csinált mint hasznot
-        red = gpd.GeoSeries([], crs=edges.crs)
 
-        network_gs_proj = kapcsolas(edges, orange, blue, red, res_area)
+        network_gs_proj = kapcsolas(edges, orange, blue, res_area, debug_path=debug_path)
 
         polygons = egyesites(network_gs_proj, debug_path=debug_path)
     else:
@@ -30,7 +28,6 @@ def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.
         # minden folt bypass-ágon érkezik.
         orange = gpd.GeoSeries([], crs=edges.crs)
         blue = gpd.GeoSeries([], crs=edges.crs)
-        red = gpd.GeoSeries([], crs=edges.crs)
         network_gs_proj = gpd.GeoSeries([], crs=edges.crs)
         polygons = gpd.GeoDataFrame(geometry=[], crs=edges.crs)
 
@@ -41,31 +38,33 @@ def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.
         polygons = pd.concat([polygons, bypass_gdf], ignore_index=True)
         polygons = gpd.GeoDataFrame(polygons, geometry="geometry", crs=edges.crs)
 
+    # Debug rétegek:
+    #   [0] 0_lakott_terulet_hatar             — itt (residential, hivatalos városhatárra vágva)
+    #   [1] 1_utcahalozat                      — kapcsolas (lakott területre vágva)
+    #   [2] 2_narancs_vonalak                  — itt
+    #   [3] 3_kek_vonalak                      — itt
+    #   [4] 4_egyesitett_uthalozat             — kapcsolas (snap előtti nyers háló)
+    #   [5] 5_egyesitett_uthalozat_tisztitott  — kapcsolas (tisztítás után)
+    #   [6] 6_nyers_poligonok                  — itt (polygonize + bypass-foltok, a besorolás bemenete)
     if debug_path is not None:
-        gpd.GeoDataFrame(
-            geometry=edges.geometry.reset_index(drop=True), crs=edges.crs
-        ).to_file(debug_path, layer="1_utcak", driver="GPKG")
+        if len(res_cut) > 0:
+            res_cut_hatar = unary_union(list(res_cut.geometry)).boundary
+            gpd.GeoDataFrame(geometry=extract_lines(res_cut_hatar), crs=edges.crs).to_file(
+                debug_path, layer="0_lakott_terulet_hatar", driver="GPKG"
+            )
 
         if len(orange) > 0:
             gpd.GeoDataFrame(geometry=list(orange), crs=orange.crs).to_file(
-                debug_path, layer="1a_orange_zsakutca", driver="GPKG"
+                debug_path, layer="2_narancs_vonalak", driver="GPKG"
             )
 
         if len(blue) > 0:
             gpd.GeoDataFrame(geometry=list(blue), crs=blue.crs).to_file(
-                debug_path, layer="1b_blue_hatarkozeli", driver="GPKG"
+                debug_path, layer="3_kek_vonalak", driver="GPKG"
             )
 
-        if len(red) > 0:
-            gpd.GeoDataFrame(geometry=list(red), crs=red.crs).to_file(
-                debug_path, layer="1c_red_hatarelhosszabbitas", driver="GPKG"
-            )
-
-        gpd.GeoDataFrame(geometry=list(network_gs_proj), crs=network_gs_proj.crs).to_file(
-            debug_path, layer="2_utcak_hatarral", driver="GPKG"
-        )
-
-        polygons.to_file(debug_path, layer="4_poligonok_nyersen", driver="GPKG")
+        if len(polygons) > 0:
+            polygons.to_file(debug_path, layer="6_nyers_poligonok", driver="GPKG")
 
     return polygons
 
@@ -73,7 +72,7 @@ def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.
 
 def generalas_pipeline(VAROS, debug=False, export=True):
 
-    debug_path = f"./adatok/{VAROS}_debug_halozat.gpkg" if debug else None
+    debug_path = f"./adatok/{VAROS}_debug.gpkg" if debug else None
 
     # beolvasom az összekapcsolt pontok df-et
     gdf = gpd.read_file('../data/work_data/osszekapcsolt_pontok_es_cimek_v2.gpkg')
@@ -123,15 +122,14 @@ def generalas_pipeline(VAROS, debug=False, export=True):
         print(f"[{VAROS}] {e} — kihagyom.")
         return None, None
 
-    # utcakövető méret-alapú feldarabolás a szkid-besorolás ELŐTT
-    gdf_szigetek = meret_alapu_felosztas(gdf_szigetek)
-
-    if debug_path is not None:
-        gdf_szigetek.to_file(debug_path, layer="5_poligonok_felosztva", driver="GPKG")
+    # Megjegyzés: a méret-alapú előfelosztás (meret_alapu_felosztas) szándékosan
+    # KIMARAD — önkényes bbox-felezéseket vinne a cellákba, miközben a tényleges
+    # szavazókör-határt az utcahálózati cellák + a pont-alapú módszerek adják.
 
     # szavazókörhöz rendelem a poligonokat
-    # ideiglenesen: skip_felezes=True → vegyes cellák nem bomlanak tovább (többségi szkid)
-    results = pontok_polygonban(gdf, gdf_szigetek, max_depth=45, skip_felezes=True)
+    # >>> TESZT: skip_felezes=True → vegyes cellák a többségi szkid-hez kerülnek,
+    # a polygon_szkid_linearis_vagas (LinearSVC) ideiglenesen kikapcsolva <<<
+    results = pontok_polygonban(gdf, gdf_szigetek, skip_felezes=True)
 
     # azokat a területeket amiben nincsen cím hozzárendelem a legnagyobb átfedésű szomszéd szavazókörhöz
     results_filled = ures_polyk_besorolasa(results)

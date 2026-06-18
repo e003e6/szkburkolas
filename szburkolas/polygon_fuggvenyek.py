@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
-from shapely.ops import unary_union, linemerge, polygonize, polygonize_full, split as shp_split
+from shapely.ops import unary_union, linemerge, polygonize, polygonize_full, split as shp_split, snap as shp_snap
 from shapely import make_valid, set_precision
 from shapely.geometry import LineString, Polygon, MultiPolygon, Point, GeometryCollection
 
@@ -133,9 +133,14 @@ def res_area_es_boundary(res_cut, edges):
     return res_area, boundary, bypass_polys
 
 
-def orange_gen(Gp, nodes, edges, MAX_EXT=200.0, EPS=0.25, MIN_SEG=0.1):
+def orange_gen(Gp, nodes, edges, boundary, MAX_EXT=200.0, EPS=0.25, MIN_SEG=0.1):
     '''
-    NARANCS (dead-end -> következő utca)
+    NARANCS (dead-end -> következő utca VAGY a lakott területi határ)
+
+    A zsákutca-végből az utca folytatásában lőtt sugár a {legközelebbi MÁSIK utca,
+    határvonal} közül a KÖZELEBBINÉL áll meg. Így a narancs vonal sosem lép ki a
+    lakott területből (a határ ugyanúgy megállítja, mint a kéknél), tehát utólag
+    nem kell res_area-ra klippelni.
     '''
 
     deg = dict(Gp.to_undirected().degree())
@@ -190,6 +195,15 @@ def orange_gen(Gp, nodes, edges, MAX_EXT=200.0, EPS=0.25, MIN_SEG=0.1):
                 continue
             inter = ray.intersection(row.geometry)
             for p in _pts(inter):
+                s = ray.project(p)
+                if s <= EPS or s >= best_s:
+                    continue
+                best_s, best_p = s, p
+
+        # A lakott területi határ is megállítja a sugarat: ha az közelebb van,
+        # mint a legközelebbi utca, a narancs a határnál áll meg (nem lép ki).
+        if boundary is not None:
+            for p in _pts(ray.intersection(boundary)):
                 s = ray.project(p)
                 if s <= EPS or s >= best_s:
                     continue
@@ -262,104 +276,11 @@ def blue_gen(Gp, nodes, boundary, DIST_LIM=100.0, MIN_SEG=0.1, EPS=0.25, RAY_MUL
     return gpd.GeoSeries(blue, crs=nodes.crs)
 
 
-def red_gen(res_area, edges, orange, blue, MAX_RAY=1000.0, INSIDE_EPS=0.5, EPS=0.25, MIN_SEG=0.1, SHARP_MAX_ANGLE_DEG=150.0):
-    '''
-    VÖRÖS (lakott területi határ-él befelé meghosszabbítás)
-
-    A polygon határ MINDEN csúcsában mindkét szomszédos él folytatását kipróbálja
-    a polygon BELSEJE felé. Ha a folytatás tényleg befelé mutat (probe contains),
-    egy MAX_RAY cap-pel sugarat lő és megáll az ELSŐ találatnál: utca / orange /
-    blue vagy MÁSIK határvonal. Konkáv csúcsoknál (pl. kinyúló városrész alapja)
-    ez befelé nyúló "vágóvonalakat" képez — segít elvágni a kinyúlás környékén
-    a látszólag nem párhuzamos, de lényegében határ-közeli utcákat.
-    '''
-
-    boundary_line = res_area.boundary
-    boundary_lines = extract_lines(boundary_line)
-
-    street_lines = [g for g in edges.geometry if g is not None and not g.is_empty]
-    orange_lines = [g for g in orange.geometry if g is not None and not g.is_empty] if orange is not None and len(orange) else []
-    blue_lines = [g for g in blue.geometry if g is not None and not g.is_empty] if blue is not None and len(blue) else []
-
-    target_lines = street_lines + orange_lines + blue_lines + boundary_lines
-    if not target_lines:
-        return gpd.GeoSeries([], crs=edges.crs)
-
-    target_union = unary_union(target_lines)
-
-    cos_threshold = np.cos(np.radians(SHARP_MAX_ANGLE_DEG))
-
-    rings = []
-    if res_area.geom_type == "Polygon":
-        rings.append(res_area.exterior)
-        rings.extend(res_area.interiors)
-    elif res_area.geom_type == "MultiPolygon":
-        for p in res_area.geoms:
-            rings.append(p.exterior)
-            rings.extend(p.interiors)
-
-    red = []
-    for ring in rings:
-        coords = list(ring.coords)
-        n = len(coords) - 1
-        if n < 3:
-            continue
-
-        for i in range(n):
-            prev = coords[(i - 1) % n]
-            curr = coords[i]
-            nxt = coords[(i + 1) % n]
-
-            vp_x = prev[0] - curr[0]
-            vp_y = prev[1] - curr[1]
-            vn_x = nxt[0] - curr[0]
-            vn_y = nxt[1] - curr[1]
-            vp_len = (vp_x * vp_x + vp_y * vp_y) ** 0.5
-            vn_len = (vn_x * vn_x + vn_y * vn_y) ** 0.5
-            if vp_len == 0 or vn_len == 0:
-                continue
-            cos_a = (vp_x * vn_x + vp_y * vn_y) / (vp_len * vn_len)
-            if cos_a <= cos_threshold:
-                continue
-
-            for other in (prev, nxt):
-                dx = curr[0] - other[0]
-                dy = curr[1] - other[1]
-                nrm = (dx * dx + dy * dy) ** 0.5
-                if nrm == 0:
-                    continue
-                dx /= nrm
-                dy /= nrm
-
-                probe = Point(curr[0] + dx * INSIDE_EPS, curr[1] + dy * INSIDE_EPS)
-                if not res_area.contains(probe):
-                    continue
-
-                far = Point(curr[0] + dx * MAX_RAY, curr[1] + dy * MAX_RAY)
-                start = Point(curr)
-                ray = LineString([start, far])
-
-                inter = ray.intersection(target_union)
-                best_p, best_s = None, np.inf
-                for p in _pts(inter):
-                    s = ray.project(p)
-                    if s <= EPS or s >= best_s:
-                        continue
-                    best_s, best_p = s, p
-
-                if best_p is not None:
-                    seg = LineString([start, best_p])
-                    if seg.length > MIN_SEG:
-                        red.append(seg)
-
-    return gpd.GeoSeries(red, crs=edges.crs)
-
-
 def szur_hatarral_parhuzamos(tier_lines, boundary_line, PARALLEL_TOL, cutter_lines=None):
     '''
     A határ PARALLEL_TOL bufferén belüli sub-szakaszokat törli a tier_lines-ból.
 
-    Ha cutter_lines meg van adva (red/blue/orange helperek), a tier vonalakat
+    Ha cutter_lines meg van adva (blue/orange helperek), a tier vonalakat
     ELŐSZÖR szétdarabolja a helper-keresztezési pontokon. A buffer-sávon belüli
     sub-szakaszt csak akkor dobja el, ha egyik végpontja sem horgonyoz helper-
     végpontot — különben megőrzi, hogy a helper ne lógjon a levegőben a törölt
@@ -462,16 +383,199 @@ def v_shape_fix(lines, V_TOL, V_ANGLE_MAX_DEG=30.0):
     return [ln for k, ln in enumerate(lines) if k not in to_remove]
 
 
-def kapcsolas(edges, orange, blue, red, res_area, PARALLEL_TOL=15.0, V_TOL=3.0):
-    '''
-    Vonalháló összerakása generálás-utáni snap NÉLKÜL.
+# === parallel_snap segédek ===
 
-    Alapelv: a helperek (red/blue/orange) `ray.intersection(target)`-tel készülnek,
-    vagyis a végpontjuk PONTOSAN a célvonalon van. `unary_union` a rendes noding-ot
-    önmagában elvégzi — minden helper-végpont automatikusan közös csúcs lesz a
-    célvonalban is. Nincs szükség cluster_merge/snap/reanchor lépésekre; azok
-    csak elmozdítanák a végpontokat a pontos találkozási pontról, és így
-    dangle-lé tennék a helpert.
+def _grid_key(x, y, grid=0.01):
+    return (round(x / grid), round(y / grid))
+
+
+def apply_coord_map(line, coord_map, grid=0.01):
+    '''
+    Egy LineString minden csúcsát, amelynek rács-kulcsa benne van a coord_map-ben,
+    átírjuk az új koordinátára. Így ha egy snapelt utca-csúcs koordinátája azonos
+    egy másik (nem-snapelt) vonal csúcsával, az utóbbi is "elmozdul vele".
+    '''
+    if line is None or line.is_empty or not coord_map:
+        return line
+    new_coords = []
+    changed = False
+    for c in line.coords:
+        k = _grid_key(c[0], c[1], grid)
+        if k in coord_map:
+            new = coord_map[k]
+            new_coords.append((new[0], new[1]))
+            if abs(new[0] - c[0]) > 1e-9 or abs(new[1] - c[1]) > 1e-9:
+                changed = True
+        else:
+            new_coords.append((c[0], c[1]))
+    if not changed:
+        return line
+    deduped = [new_coords[0]]
+    for c in new_coords[1:]:
+        if c != deduped[-1]:
+            deduped.append(c)
+    if len(deduped) < 2:
+        return None
+    return LineString(deduped)
+
+
+def _snap_line_to_target(ln, target, SNAP_TOL, grid=0.01):
+    '''
+    Egy vonalat snap-el a target felé (shapely.ops.snap). Visszatér a snapelt vonallal
+    és egy coord_map dict-tel (old grid-key → new (x,y)), ami a drag-along lépéshez kell.
+    '''
+    snapped = shp_snap(ln, target, SNAP_TOL)
+    if snapped is None or snapped.is_empty:
+        return ln, {}
+    if snapped.geom_type != "LineString":
+        return ln, {}
+    old_coords = list(ln.coords)
+    new_coords = list(snapped.coords)
+    coord_map = {}
+    if len(old_coords) == len(new_coords):
+        for old, new in zip(old_coords, new_coords):
+            if abs(new[0] - old[0]) > 1e-9 or abs(new[1] - old[1]) > 1e-9:
+                coord_map[_grid_key(old[0], old[1], grid)] = (new[0], new[1])
+    else:
+        for old, new in ((old_coords[0], new_coords[0]), (old_coords[-1], new_coords[-1])):
+            if abs(new[0] - old[0]) > 1e-9 or abs(new[1] - old[1]) > 1e-9:
+                coord_map[_grid_key(old[0], old[1], grid)] = (new[0], new[1])
+    return snapped, coord_map
+
+
+def _is_parallel(line, target, SNAP_TOL, MIN_PARALLEL_LEN):
+    if line is None or line.is_empty or target is None or target.is_empty:
+        return False
+    try:
+        inter = line.intersection(target.buffer(SNAP_TOL))
+    except Exception:
+        return False
+    return inter.length >= MIN_PARALLEL_LEN
+
+
+def _snap_pass(subjects, target, SNAP_TOL, MIN_PARALLEL_LEN, drag_groups, grid=0.01):
+    '''
+    Egy snap-fázis: subjects → target (parallel-jelölés + snap + drag-along).
+    drag_groups: list of (list-ref), amelyek mindegyikére alkalmazni kell a coord_map-et.
+    Visszatér: (új subjects lista, snap-elt darabszám).
+    '''
+    if target is None or target.is_empty or not subjects:
+        return subjects, 0
+    coord_map = {}
+    new_subjects = list(subjects)
+    snapped_idxs = set()
+    count = 0
+    for i, s in enumerate(subjects):
+        if s is None or s.is_empty:
+            continue
+        if _is_parallel(s, target, SNAP_TOL, MIN_PARALLEL_LEN):
+            snapped, cmap = _snap_line_to_target(s, target, SNAP_TOL, grid=grid)
+            new_subjects[i] = snapped
+            snapped_idxs.add(i)
+            coord_map.update(cmap)
+            count += 1
+    if coord_map:
+        # nem-snap-jelölt subjects-en alkalmazzuk a drag-et
+        for i in range(len(new_subjects)):
+            if i in snapped_idxs:
+                continue
+            new_subjects[i] = apply_coord_map(new_subjects[i], coord_map, grid=grid)
+        # és a többi listán (streets, helpers stb.)
+        for lst in drag_groups:
+            for j in range(len(lst)):
+                lst[j] = apply_coord_map(lst[j], coord_map, grid=grid)
+    return new_subjects, count
+
+
+def parallel_snap(streets, helpers, boundary_lines, SNAP_TOL=3.0, MIN_PARALLEL_LEN=10.0, verbose=True):
+    '''
+    Hierarchikus parallel-snap:
+      1) streets → boundary
+      2) helpers → boundary
+      3) helpers → streets (a (1)+(2) utáni frissült streets-en)
+      4) helpers → helpers (a rövidebb a hosszabbhoz)
+    A snap "magával húzza" a kapcsolódó éleket: minden lépés után a coord_map alapján
+    a nem-snap-jelölt vonalak coord-jait is áthelyezzük.
+
+    Bemenet: streets, helpers — LineString listák. boundary_lines — LineString lista.
+    Visszatér: (streets, helpers) — szűrt, snap-elt listák.
+    '''
+    streets = [s for s in streets if s is not None and not s.is_empty]
+    helpers = [h for h in helpers if h is not None and not h.is_empty]
+    boundary_union = unary_union(boundary_lines) if boundary_lines else None
+
+    stats = {'s_to_b': 0, 'h_to_b': 0, 'h_to_s': 0, 'h_to_h': 0}
+
+    # 1) streets → boundary
+    streets, stats['s_to_b'] = _snap_pass(streets, boundary_union, SNAP_TOL, MIN_PARALLEL_LEN,
+                                          drag_groups=[helpers])
+
+    # 2) helpers → boundary
+    helpers, stats['h_to_b'] = _snap_pass(helpers, boundary_union, SNAP_TOL, MIN_PARALLEL_LEN,
+                                          drag_groups=[streets])
+
+    # 3) helpers → streets
+    streets_union = unary_union([s for s in streets if s is not None and not s.is_empty])
+    helpers, stats['h_to_s'] = _snap_pass(helpers, streets_union, SNAP_TOL, MIN_PARALLEL_LEN,
+                                          drag_groups=[])  # streets target, nem dragoljuk
+
+    # 4) helpers → helpers (rövidebb a hosszabbhoz)
+    # Sorrend: csökkenő hossz; mindig az aktuális helper-re tesszük a TÖBBI uniojáraval szembeni snap-et,
+    # de csak a hosszabbak halmaza (még nem snap-elt) a target.
+    if len(helpers) >= 2:
+        coord_map_h = {}
+        snapped_idxs = set()
+        order = sorted(range(len(helpers)),
+                       key=lambda i: -(helpers[i].length if helpers[i] is not None and not helpers[i].is_empty else 0))
+        for pos in range(len(order) - 1, 0, -1):
+            i = order[pos]
+            if i in snapped_idxs:
+                continue
+            h = helpers[i]
+            if h is None or h.is_empty:
+                continue
+            longer_idxs = [order[p] for p in range(pos) if order[p] not in snapped_idxs]
+            longer_lines = [helpers[j] for j in longer_idxs
+                            if helpers[j] is not None and not helpers[j].is_empty]
+            if not longer_lines:
+                continue
+            cand_union = unary_union(longer_lines)
+            if _is_parallel(h, cand_union, SNAP_TOL, MIN_PARALLEL_LEN):
+                snapped, cmap = _snap_line_to_target(h, cand_union, SNAP_TOL)
+                helpers[i] = snapped
+                snapped_idxs.add(i)
+                coord_map_h.update(cmap)
+                stats['h_to_h'] += 1
+        if coord_map_h:
+            for j in range(len(helpers)):
+                if j in snapped_idxs:
+                    continue
+                helpers[j] = apply_coord_map(helpers[j], coord_map_h)
+            for j in range(len(streets)):
+                streets[j] = apply_coord_map(streets[j], coord_map_h)
+
+    streets = [s for s in streets if s is not None and not s.is_empty and s.length > 1e-6]
+    helpers = [h for h in helpers if h is not None and not h.is_empty and h.length > 1e-6]
+
+    if verbose:
+        print(f"[parallel_snap] s→b: {stats['s_to_b']}, h→b: {stats['h_to_b']}, "
+              f"h→s: {stats['h_to_s']}, h→h: {stats['h_to_h']}  "
+              f"(SNAP_TOL={SNAP_TOL}m, MIN_PARALLEL_LEN={MIN_PARALLEL_LEN}m)")
+
+    return streets, helpers
+
+
+def kapcsolas(edges, orange, blue, res_area, SNAP_TOL=10.0, MIN_PARALLEL_LEN=15.0, V_TOL=8.0, debug_path=None):
+    '''
+    Vonalháló összerakása parallel-aktivált, drag-connected snap-pel.
+
+    1) Boundary + streets + helpers (blue/orange) clip-elése res_area-ra.
+    2) (Debug) pre-snap union kiírása `2a_egyesites_pre_snap` rétegként, ha `debug_path` adott.
+    3) `parallel_snap`: hierarchikus snap (streets→boundary, helpers→boundary,
+       helpers→streets, helpers→helpers). Csak ott sül el, ahol két vonal
+       legalább MIN_PARALLEL_LEN méteren át a SNAP_TOL bufferében fut. A snap
+       a coord_map alapján "magával húzza" a kapcsolódó nem-snapelt éleket.
+    4) Noding + V-fix + dangle-loop a snapelt linework-ön.
     '''
     boundary_line = res_area.boundary
     boundary_lines = extract_lines(boundary_line)
@@ -482,18 +586,38 @@ def kapcsolas(edges, orange, blue, red, res_area, PARALLEL_TOL=15.0, V_TOL=3.0):
     def _geoms(gs):
         return [g for g in gs.geometry if g is not None and not g.is_empty] if gs is not None and len(gs) else []
 
+    # Csak az utcahálózatot kell res_area-ra vágni: a teljes települési hálózat a
+    # lakott területen kívüli utakat is tartalmazza. A helperek viszont konstrukció
+    # szerint a határon belül végződnek (orange: utcáig/határig, blue: határig),
+    # ezért NEM klippeljük őket — a vágás csak elmozdítaná a végpontjukat.
     streets_raw = clip_lines(list(edges.geometry), res_area)
-    red_f     = clip_lines(_geoms(red),    res_area)
-    blue_f    = clip_lines(_geoms(blue),   res_area)
-    orange_f  = clip_lines(_geoms(orange), res_area)
+    blue_f    = _geoms(blue)
+    orange_f  = _geoms(orange)
 
-    # Határ-párhuzamos streets szűrése; helper-keresztezéseknél az utcát a
-    # kereszt-pontnál vágja és a helper-horgonyos sub-szakaszt akkor is tartja,
-    # ha a bufferben van (különben a helper lelógna).
-    streets_f = szur_hatarral_parhuzamos(streets_raw, boundary_line, PARALLEL_TOL,
-                                         cutter_lines=red_f + blue_f + orange_f)
+    # [DEBUG 1] hivatalos utcahálózat lakott területre vágva, egyesítve.
+    if debug_path is not None and streets_raw:
+        streets_union = unary_union(streets_raw)
+        gpd.GeoDataFrame(geometry=extract_lines(streets_union), crs=edges.crs).to_file(
+            debug_path, layer="1_utcahalozat", driver="GPKG"
+        )
 
-    all_lines = list(boundary_lines) + list(streets_f) + list(red_f) + list(blue_f) + list(orange_f)
+    # [DEBUG 4] a snap ELŐTTI, egyesített nyers vonalháló (boundary + utcák + helperek).
+    if debug_path is not None:
+        pre_lines = list(boundary_lines) + list(streets_raw) + list(blue_f) + list(orange_f)
+        if pre_lines:
+            pre_union = set_precision(unary_union(pre_lines), 0.01)
+            gpd.GeoDataFrame(geometry=extract_lines(pre_union), crs=edges.crs).to_file(
+                debug_path, layer="4_egyesitett_uthalozat", driver="GPKG"
+            )
+
+    # Parallel-snap: streets és helperek külön listák, boundary a horgony.
+    helpers_in = list(blue_f) + list(orange_f)
+    streets_snapped, helpers_snapped = parallel_snap(
+        streets_raw, helpers_in, boundary_lines,
+        SNAP_TOL=SNAP_TOL, MIN_PARALLEL_LEN=MIN_PARALLEL_LEN,
+    )
+
+    all_lines = list(boundary_lines) + list(streets_snapped) + list(helpers_snapped)
     if not all_lines:
         raise RuntimeError("Nincs semmi a végső hálóhoz (all_lines üres).")
 
@@ -517,13 +641,26 @@ def kapcsolas(edges, orange, blue, red, res_area, PARALLEL_TOL=15.0, V_TOL=3.0):
     merged_geom = linemerge(u_lines) if u_lines else linework
     final_lines = extract_lines(merged_geom) or u_lines
 
+    # [DEBUG 5] a vonaltisztító függvények (snap + noding + V-fix + dangle-loop)
+    # utáni, kész zárt vonalháló — az egyesites bemenete.
+    if debug_path is not None and final_lines:
+        gpd.GeoDataFrame(geometry=final_lines, crs=edges.crs).to_file(
+            debug_path, layer="5_egyesitett_uthalozat_tisztitott", driver="GPKG"
+        )
+
     return gpd.GeoSeries(final_lines, crs=edges.crs)
 
 
-def egyesites(network_gs_proj, MIN_AREA=500, MAX_STEPS=20000, debug_path=None):
+def egyesites(network_gs_proj, debug_path=None):
     '''
-    MIN_AREA m2: ez alatt beolvasztjuk
-    MAX_STEPS biztonsági limit (nagy hálónál se szálljon el)
+    A zárt vonalhurkokat poligonokká tölti (polygonize) és MINDEN cellát megtart.
+
+    Szándékosan NINCS méret-alapú beolvasztás: a finom felbontást a
+    szkid-besorolásig meg kell őrizni (két szomszédos, eltérő szavazókörű kis
+    cella nem olvadhat egybe a kategorizálás előtt). Az üres (cím nélküli)
+    cellákat a besorolás UTÁN az `ures_polyk_besorolasa` szívja fel a leghosszabb
+    közös határú szomszédjukba.
+
     A bemenő háló már tiszta (kapcsolas már levágta a dangle-eket, 1cm rácson van).
     '''
 
@@ -541,49 +678,8 @@ def egyesites(network_gs_proj, MIN_AREA=500, MAX_STEPS=20000, debug_path=None):
     polygons_gdf = polygons_gdf[polygons_gdf.geometry.type.isin(["Polygon", "MultiPolygon"])].reset_index(drop=True)
 
     if debug_path is not None:
-        polygons_gdf.to_file(debug_path, layer="3a_poligonok_polygonize_raw", driver="GPKG")
-        print(f"[egyesites] polygonize raw: {len(polygons_gdf)} poligon; "
-              f"{(polygons_gdf.geometry.area < MIN_AREA).sum()} < MIN_AREA ({MIN_AREA} m²) — ezeket összevonja a merge-loop")
+        # A 6_nyers_poligonok réteget a poly_gen_pipeline írja ki, MIUTÁN a bypass
+        # (út nélküli lakott) foltokat is hozzáfűzte — így a teljes cella-halmaz látszik.
+        print(f"[egyesites] polygonize raw: {len(polygons_gdf)} poligon (beolvasztás nélkül, minden cella megmarad)")
 
-    orig_union = unary_union(polygons_gdf.geometry)
-
-    pg = polygons_gdf.copy().reset_index(drop=True)
-
-    def shared_boundary_length(a, b):
-        inter = a.boundary.intersection(b.boundary)
-        return getattr(inter, "length", 0.0)
-
-    steps = 0
-    while steps < MAX_STEPS:
-        steps += 1
-
-        areas = pg.geometry.area
-        small_idx = areas[areas < MIN_AREA].index.tolist()
-        if not small_idx:
-            break
-
-        i = min(small_idx, key=lambda k: areas.iloc[k])
-        gi = pg.geometry.iloc[i]
-
-        sidx = pg.sindex
-        cand = [j for j in sidx.intersection(gi.bounds) if j != i]
-
-        best_j, best_len = None, 0.0
-        for j in cand:
-            L = shared_boundary_length(gi, pg.geometry.iloc[j])
-            if L > best_len:
-                best_len = L
-                best_j = j
-
-        if best_j is None or best_len <= 0:
-            print(f"[STOP] Kicsi poligon ({i}, area={areas.iloc[i]:.6f}) nem talál valódi szomszédot közös éllel.")
-            break
-
-        pg.at[best_j, "geometry"] = make_valid(unary_union([gi, pg.geometry.iloc[best_j]]))
-        pg = pg.drop(index=i).reset_index(drop=True)
-
-    final_union = unary_union(pg.geometry)
-    symdiff_area = float(orig_union.symmetric_difference(final_union).area)
-    print("Ellenőrzés: symmetric_difference area (terület eltérés):", symdiff_area)
-
-    return pg
+    return polygons_gdf

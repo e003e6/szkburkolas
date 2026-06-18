@@ -81,12 +81,25 @@ b. Szín hozzárendelés szavazókörönként: golden ratio hue elosztással →
 c. `pontok_polygonban` – minden cellához pont-szavazókör megfeleltetés:
    - 0 pont a cellában → `szavazokorid = None`
    - Pontosan 1 szavazókör → hozzárendeljük
-   - Több szavazókör → `polygon_tobb_szavazokor` (rekurzív szétbontás)
-d. `polygon_tobb_szavazokor` – vegyes cellák szétbontása (stack-alapú DFS):
-   - A cellát felezzük a centroid mentén, a hosszabb tengelyen
-   - Minden felére újraszűrjük a pontokat
-   - Ha egy fél egységes (1 szavazókör) → kész; ha vegyes → vissza a stackbe
-   - `max_depth` korlát a végtelen ciklus ellen
+   - Több szavazókör → `polygon_szkid_linearis_vagas` (egyetlen lineáris vágás)
+d. `polygon_szkid_linearis_vagas` – vegyes cellák egyetlen lineáris vágása (NEM rekurzív):
+   - Top-2 leggyakoribb szkid pontjaira `sklearn.svm.LinearSVC` (class_weight='balanced')
+     fit-tel egy lineáris szeparátort. A 3.+ szkid pontok a tréningből kimaradnak,
+     de az utólagos oldal-besorolásból nem.
+   - A szeparátor egyenesével a poligont kettévágjuk (`shapely.ops.split`). Konkáv
+     poligonnál a `split` >2 részt is adhat → a részeket előjel (`w·c + b`) szerint
+     a két oldalhoz csoportosítjuk, oldalanként `unary_union`.
+   - Hibakritérium (`LINEAR_SPLIT_MIN_MARGIN = 1.2`): mindkét oldalon a többségi
+     szkid pontszáma legalább 1.2× a kisebbségi szkid pontszáma (vagy a kisebbségi 0).
+     Üres oldal megengedett, `szavazokorid=None` lesz, és `ures_polyk_besorolasa`
+     feltölti.
+   - **Reject ág** (margó-bukás, SVC-hiba, split-hiba, túl kevés pont, degenerált
+     szeparátor) → a teljes poligont a globális többségi szkid-hez soroljuk
+     (ugyanaz mint a régi `skip_felezes=True` fallback).
+   - Konstansok modul-szinten: `LINEAR_SPLIT_MIN_MARGIN`,
+     `LINEAR_SPLIT_MIN_POINTS_PER_CLASS=2`, `LINEAR_SPLIT_MIN_ABS_MAJORITY=2`.
+   - A korábbi rekurzív `polygon_tobb_szavazokor` és `felez` függvények egyelőre
+     megmaradnak a fájlban referenciaként, de már nincsenek hívva.
 e. `ures_polyk_besorolasa` – üres cellák feltöltése:
    - Érintkező szomszédok szavazóköreit megszámoljuk → a legtöbbször előforduló = nyertes
 f. `polygonok_egyesitese` – szavazókörönkénti összevonás:
