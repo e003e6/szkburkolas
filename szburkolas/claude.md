@@ -81,23 +81,34 @@ b. Szín hozzárendelés szavazókörönként: golden ratio hue elosztással →
 c. `pontok_polygonban` – minden cellához pont-szavazókör megfeleltetés:
    - 0 pont a cellában → `szavazokorid = None`
    - Pontosan 1 szavazókör → hozzárendeljük
-   - Több szavazókör → `polygon_szkid_linearis_vagas` (egyetlen lineáris vágás)
-d. `polygon_szkid_linearis_vagas` – vegyes cellák egyetlen lineáris vágása (NEM rekurzív):
-   - Top-2 leggyakoribb szkid pontjaira `sklearn.svm.LinearSVC` (class_weight='balanced')
-     fit-tel egy lineáris szeparátort. A 3.+ szkid pontok a tréningből kimaradnak,
-     de az utólagos oldal-besorolásból nem.
-   - A szeparátor egyenesével a poligont kettévágjuk (`shapely.ops.split`). Konkáv
-     poligonnál a `split` >2 részt is adhat → a részeket előjel (`w·c + b`) szerint
-     a két oldalhoz csoportosítjuk, oldalanként `unary_union`.
-   - Hibakritérium (`LINEAR_SPLIT_MIN_MARGIN = 1.2`): mindkét oldalon a többségi
-     szkid pontszáma legalább 1.2× a kisebbségi szkid pontszáma (vagy a kisebbségi 0).
-     Üres oldal megengedett, `szavazokorid=None` lesz, és `ures_polyk_besorolasa`
-     feltölti.
-   - **Reject ág** (margó-bukás, SVC-hiba, split-hiba, túl kevés pont, degenerált
-     szeparátor) → a teljes poligont a globális többségi szkid-hez soroljuk
-     (ugyanaz mint a régi `skip_felezes=True` fallback).
-   - Konstansok modul-szinten: `LINEAR_SPLIT_MIN_MARGIN`,
-     `LINEAR_SPLIT_MIN_POINTS_PER_CLASS=2`, `LINEAR_SPLIT_MIN_ABS_MAJORITY=2`.
+   - Több szavazókör → `polygon_szkid_voronoi_vagas` (Voronoi-cellás felosztás)
+   - `debug_path` megadásakor a `voronoi_sejtek` (poligon) és `voronoi_elek` (vonal)
+     debug rétegeket is kiírja.
+d. `polygon_szkid_voronoi_vagas` – vegyes cellák Voronoi-cellás felosztása:
+   - **Magok** = a cella ÖSSZES címpontja, mindegyik a saját szkid-jével (nem csak a
+     top-2, és nem centroidok) — így kettőnél több szavazókört is pontosan kezel.
+   - A magokra Voronoi-diagramot számolunk (`shapely.ops.voronoi_diagram`, a cella
+     bbox-ára kiterjesztve), majd minden territóriumot a cellára vágunk → a sík minden
+     pontja a hozzá legközelebbi maghoz tartozik, a territórium szkid-jét a magjáé adja.
+   - Az azonos szkid-ű szomszédos territóriumokat összevonjuk (`unary_union`, dissolve)
+     → al-cellák. Ami elválasztó élként megmarad, az kizárólag a különböző szkid-ek
+     közötti Voronoi-felezővonal, pontosan a pontfelhők közötti résbe ülve.
+   - **Osztály-megőrző egyszerűsítés**: a nyers felezővonal sok apró szakaszból áll
+     (mikro-hullámzás, minden szemközti pontpárhoz egy csúcs). Mivel a felhők között
+     hézag van, bármely vonal jó, ami helyesen szétválasztja a szkid-eket. Ezért a
+     vágóélt Douglas–Peucker-rel (`shapely.simplify(preserve_topology=True)`)
+     egyszerűsítjük, és **bináris kereséssel cellánként** megkeressük a LEGNAGYOBB
+     toleranciát, amelynél a vonalra újravágva minden pont a saját szkid-darabjában
+     marad. A vágóél végpontjait (utca-horgony / csomópont) rögzítve hagyjuk, a
+     határt érintő végeket kifelé hosszabbítjuk, hogy a húr biztosan átvágja a cellát
+     (`shapely.ops.polygonize`, majd a darabokat a cellára vágjuk). Eredmény: kevés,
+     nagy, egyenes szakasz — mint egy utcahatár.
+   - Visszatérés: `(rows, cells, edges)` — `rows` a szkid szerint összevont al-cellák
+     (a tényleges kimenet), `cells` az összes levágott Voronoi-cella (`voronoi_sejtek`
+     debug réteg, a NYERS Voronoi-bontás), `edges` az EGYSZERŰSÍTETT vágóélek
+     (`voronoi_elek` debug réteg).
+   - Degenerált esetben (pl. egybeeső magok) a `pontok_polygonban` a teljes cellát a
+     többségi szkid-hez sorolja (fallback). Adattisztítás nincs — jó bemenetet feltételez.
    - A korábbi rekurzív `polygon_tobb_szavazokor` és `felez` függvények egyelőre
      megmaradnak a fájlban referenciaként, de már nincsenek hívva.
 e. `ures_polyk_besorolasa` – üres cellák feltöltése:
@@ -139,7 +150,9 @@ f. `polygonok_egyesitese` – szavazókörönkénti összevonás:
 - Kis poligonok iteratív beolvasztása (< MIN_AREA m², default 500): mindig a legkisebb cellát az azzal legnagyobb közös határú szomszédba olvasztja, amíg minden cella ≥ MIN_AREA.
 
 ### 2–6. Szavazókörökhöz rendelés (`generalas_pipeline`)
-A V2 lépések változatlanok: `meret_alapu_felosztas` → `pontok_polygonban` → (`polygon_tobb_szavazokor`) → `ures_polyk_besorolasa` → `rebuild_coverage` → `polygonok_egyesitese`. Részletek a V2 szekcióban.
+A V2 lépések változatlanok: `meret_alapu_felosztas` → `pontok_polygonban` → (`polygon_tobb_szavazokor`) → `ures_polyk_besorolasa` → `rebuild_coverage` → **`hibas_szigetek_torlese`** → `polygonok_egyesitese`. Részletek a V2 szekcióban.
+
+**Végső adattisztítás (`hibas_szigetek_torlese`)**: a `rebuild_coverage` és a `polygonok_egyesitese` közé illesztve. Hibás forrásadat miatt (rossz koordináta → rossz `szavazokorid`) a coverage egy-egy cellája rossz szavazókörhöz kerülhet, ami az egyesítés után a szavazókör távoli, EGYETLEN címet tartalmazó szigeteként jelenik meg (egy másik szk területébe ágyazva). A függvény szavazókörönként szigetekre bont (`_extract_polys`), megszámolja a beleeső címeket, és a `min_cimek` (alapért. 1) küszöb alatti szigetek celláit `szavazokorid=None`-ra állítja, majd az `ures_polyk_besorolasa`-val a leghosszabb közös határú szomszédhoz (= körülvevő szk) sorolja át. Biztonsági korlát: egy szavazókör ÖSSZES szigetét sosem törli (a legnagyobb területűt megtartja). A `gdf` címpontokat szándékosan nem módosítja (a koordináta úgyis hibás).
 
 **Egy-szavazóköri shortcut**: a `generalas_pipeline` a címjegyzék településre-szűrése után megnézi hány egyedi `szavazokorid` van. Ha pontosan 1, a teljes vonalháló-generálás (`poly_gen_pipeline`, `meret_alapu_felosztas`, `pontok_polygonban`, stb.) kimarad — csak a residential poligont kérjük le (`letoltes_csak_res`, útgráf nélkül), városhatárra vágjuk (`vag_residential_city`), és az unió lesz a szavazóköri poligon.
 

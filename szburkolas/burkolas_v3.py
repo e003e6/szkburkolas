@@ -127,9 +127,9 @@ def generalas_pipeline(VAROS, debug=False, export=True):
     # szavazókör-határt az utcahálózati cellák + a pont-alapú módszerek adják.
 
     # szavazókörhöz rendelem a poligonokat
-    # >>> TESZT: skip_felezes=True → vegyes cellák a többségi szkid-hez kerülnek,
-    # a polygon_szkid_linearis_vagas (LinearSVC) ideiglenesen kikapcsolva <<<
-    results = pontok_polygonban(gdf, gdf_szigetek, skip_felezes=True)
+    # vegyes (több szkid-ű) cellák Voronoi-cellás felosztása (polygon_szkid_voronoi_vagas);
+    # debug=True esetén a voronoi_sejtek / voronoi_elek rétegeket is kiírja a debug GPKG-be
+    results = pontok_polygonban(gdf, gdf_szigetek, skip_felezes=False, debug_path=debug_path)
 
     # azokat a területeket amiben nincsen cím hozzárendelem a legnagyobb átfedésű szomszéd szavazókörhöz
     results_filled = ures_polyk_besorolasa(results)
@@ -137,6 +137,11 @@ def generalas_pipeline(VAROS, debug=False, export=True):
     # felez() split sub-nm FP-drift eltüntetése: coverage újra-topológizálása
     # boundary-noding + polygonize segítségével
     results_clean = rebuild_coverage(results_filled)
+
+    # végső adattisztítás: a hibás forrásadat miatt keletkező egy-címes
+    # szavazókör-szigeteket törlöm, területüket a körülvevő (leghosszabb közös
+    # határú) szomszéd szavazókör nyeli el
+    results_clean = hibas_szigetek_torlese(results_clean, gdf)
 
     # a kis parcellákat egyesítem egyetelen multypolygonba
     merged = polygonok_egyesitese(results_clean)

@@ -1,19 +1,10 @@
 import pandas as pd
 import geopandas as gpd
 import colorsys
-import numpy as np
 
-from shapely.ops import unary_union, split, polygonize
+from shapely.ops import unary_union, split, polygonize, voronoi_diagram, linemerge
 from shapely import make_valid
-from shapely.geometry import LineString, MultiPolygon
-from sklearn.svm import LinearSVC
-
-
-LINEAR_SPLIT_MIN_MARGIN = 1.2
-LINEAR_SPLIT_MIN_POINTS_PER_CLASS = 2
-LINEAR_SPLIT_MIN_ABS_MAJORITY = 2
-LINEAR_SPLIT_MAX_ITER_SVC = 10000
-LINEAR_SPLIT_RANDOM_STATE = 0
+from shapely.geometry import LineString, MultiPolygon, MultiPoint, Point
 
 
 def _distinct_hex_colors(n, s=0.62, v1=0.92, v2=0.78):
@@ -45,12 +36,15 @@ def add_color_to_gdf(gdf):
     return gdf
 
 
-def pontok_polygonban(gdf, gdf_szigetek, max_depth=3, skip_felezes=False):
+def pontok_polygonban(gdf, gdf_szigetek, max_depth=3, skip_felezes=False, debug_path=None):
     '''
     Végigmegy minden poligonon, megkeresi a pontokat, és:
-      - ha több szavazókör van egy poligonon belül -> rekurzív felezés
-          (skip_felezes=True esetén: többségi szavazókör kap hozzárendelést, nem bontjuk)
+      - ha több szavazókör van egy poligonon belül -> Voronoi-cellás felosztás
+          (polygon_szkid_voronoi_vagas; skip_felezes=True esetén helyette a többségi
+           szavazókör kapja az egész cellát, nem bontjuk)
       - ha egyetlen szavazókör van -> results sorba menti
+    debug_path megadásakor a voronoi_sejtek (poligon) és voronoi_elek (vonal) debug
+    rétegeket is kiírja a megadott GPKG-be.
     '''
 
     if gdf.crs is None or gdf_szigetek.crs is None:
@@ -60,6 +54,8 @@ def pontok_polygonban(gdf, gdf_szigetek, max_depth=3, skip_felezes=False):
         gdf = gdf.to_crs(gdf_szigetek.crs)
 
     rows = []
+    voronoi_cells = []
+    voronoi_edges = []
 
     for poly_idx, poly_row in gdf_szigetek.iterrows():
         polygon_geom = poly_row.geometry
@@ -81,7 +77,20 @@ def pontok_polygonban(gdf, gdf_szigetek, max_depth=3, skip_felezes=False):
                 ].iloc[0]
                 rows.append({"szavazokorid": winner, "color": winner_color, "geometry": polygon_geom})
             else:
-                rows.extend(polygon_szkid_linearis_vagas(polygon_geom, points_inside))
+                try:
+                    sub_rows, cells, edges = polygon_szkid_voronoi_vagas(polygon_geom, points_inside)
+                    rows.extend(sub_rows)
+                    voronoi_cells.extend(cells)
+                    voronoi_edges.extend(edges)
+                except Exception as e:
+                    # degenerált eset (pl. egybeeső magok): többségi szkid fallback
+                    print(f"[voronoi_split] hiba, többségi fallback: {e}")
+                    counts = points_inside["szavazokorid"].dropna().value_counts()
+                    winner = counts.index[0]
+                    winner_color = points_inside.loc[
+                        points_inside["szavazokorid"] == winner, "color"
+                    ].iloc[0]
+                    rows.append({"szavazokorid": winner, "color": winner_color, "geometry": polygon_geom})
             continue
 
         rows.append({
@@ -90,7 +99,17 @@ def pontok_polygonban(gdf, gdf_szigetek, max_depth=3, skip_felezes=False):
             "geometry": polygon_geom
         })
 
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=gdf_szigetek.crs)
+    results = gpd.GeoDataFrame(rows, geometry="geometry", crs=gdf_szigetek.crs)
+
+    if debug_path is not None:
+        if voronoi_cells:
+            gpd.GeoDataFrame(voronoi_cells, geometry="geometry", crs=gdf_szigetek.crs)\
+                .to_file(debug_path, layer="voronoi_sejtek", driver="GPKG")
+        if voronoi_edges:
+            gpd.GeoDataFrame(geometry=voronoi_edges, crs=gdf_szigetek.crs)\
+                .to_file(debug_path, layer="voronoi_elek", driver="GPKG")
+
+    return results
 
 
 def felez(poly):
@@ -153,152 +172,205 @@ def polygon_tobb_szavazokor(polygon_geom, points_inside, max_depth=25):
     return rows
 
 
-def _besorol_oldalra(points_inside, side_geom):
-    if side_geom is None or side_geom.is_empty:
-        return None, 0, 0, None
-    inside = points_inside[points_inside.within(side_geom)]
-    if len(inside) == 0:
-        return None, 0, 0, None
-    counts = inside["szavazokorid"].dropna().value_counts()
-    if len(counts) == 0:
-        return None, 0, 0, None
-    majority_szkid = counts.index[0]
-    majority_count = int(counts.iloc[0])
-    second_count = int(counts.iloc[1]) if len(counts) > 1 else 0
-    color = inside.loc[inside["szavazokorid"] == majority_szkid, "color"].iloc[0]
-    return majority_szkid, majority_count, second_count, color
+def _extract_polys(geom):
+    """Polygon részek kinyerése tetszőleges geometriából."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+        return [g for g in geom.geoms if g.geom_type == "Polygon" and not g.is_empty]
+    return []
 
 
-def _osszes_szkid_tobbsegre(polygon_geom, points_inside):
-    counts = points_inside["szavazokorid"].dropna().value_counts()
-    winner = counts.index[0]
-    winner_color = points_inside.loc[points_inside["szavazokorid"] == winner, "color"].iloc[0]
-    return [{"szavazokorid": winner, "color": winner_color, "geometry": polygon_geom}]
+def _extract_lines(geom):
+    """LineString részek kinyerése tetszőleges geometriából."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "LineString":
+        return [geom]
+    if geom.geom_type in ("MultiLineString", "GeometryCollection"):
+        out = []
+        for g in geom.geoms:
+            out += _extract_lines(g)
+        return out
+    return []
 
 
-def polygon_szkid_linearis_vagas(polygon_geom, points_inside, min_margin=LINEAR_SPLIT_MIN_MARGIN):
+def _merge_lines(lines):
+    """LineString-ek összevonása (linemerge csak MultiLineString-re hívható)."""
+    if not lines:
+        return []
+    merged = unary_union(lines)
+    if merged.geom_type == "MultiLineString":
+        merged = linemerge(merged)
+    return _extract_lines(merged)
+
+
+def _extend_boundary_ends(ln, boundary, delta, tol=1e-6):
+    """A vonal HATÁRON ülő végpontjait kifelé hosszabbítja delta-val (a belső
+    csomópont-végeket érintetlenül hagyja). Egy csak a végpontján érintkező húrt a
+    shapely nem vág át a poligonon — a kis túlnyúlás garantálja az átvágást, a
+    túllógó részt utána a poligonra vágással levágjuk."""
+    cs = list(ln.coords)
+    if len(cs) < 2:
+        return ln
+    if boundary.distance(Point(cs[0])) <= tol:
+        (x0, y0), (x1, y1) = cs[0], cs[1]
+        d = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5 or 1.0
+        cs[0] = (x0 - (x1 - x0) / d * delta, y0 - (y1 - y0) / d * delta)
+    if boundary.distance(Point(cs[-1])) <= tol:
+        (xa, ya), (xb, yb) = cs[-2], cs[-1]
+        d = ((xb - xa) ** 2 + (yb - ya) ** 2) ** 0.5 or 1.0
+        cs[-1] = (xb + (xb - xa) / d * delta, yb + (yb - ya) / d * delta)
+    return LineString(cs)
+
+
+def polygon_szkid_voronoi_vagas(polygon_geom, points_inside):
     '''
-    Vegyes-szkid poligon egyetlen lineáris vágása.
+    Vegyes (több szkid-ű) cella Voronoi-cellás felosztása, osztály-megőrző
+    egyszerűsítéssel.
 
-    A top-2 szkid pontjait LinearSVC szeparálja; a kapott egyenessel a poligont
-    ketté vágjuk. Mindkét oldalon a többségi/kisebbségi szkid arányt a min_margin
-    küszöbhöz mérjük. Ha bármelyik oldal nem felel meg → reject: a teljes
-    poligont a globális többségi szkid-hez soroljuk.
+    Magok = a cella ÖSSZES címpontja, mindegyik a saját szkid-jével. Minden maghoz
+    Voronoi-territóriumot rendelünk (a sík minden pontja a hozzá legközelebbi maghoz
+    tartozik), a territóriumot a cellára vágjuk és a mag szkid-jével színezzük, majd az
+    azonos szkid-ű territóriumokat összevonjuk (dissolve). A megmaradó belső él a
+    különböző szkid-ek közötti Voronoi-felezővonal.
 
-    Visszatérés: list[dict] 1 vagy 2 elemmel (szavazokorid, color, geometry).
+    Ez a pontos felezővonal sok apró szakaszból áll (mikro-hullámzás), ezért
+    osztály-megőrző módon EGYSZERŰSÍTJÜK: Douglas–Peucker-rel, és bináris kereséssel
+    cellánként megkeressük a LEGNAGYOBB toleranciát, amelynél még minden pont a saját
+    szkid-oldalán marad. A végpontok (utca-horgonyok / csomópontok) rögzítve maradnak,
+    így kevés, nagy, egyenes szakaszt kapunk — mint egy utcahatár.
+
+    Visszatérés: (rows, cells, edges)
+      rows  : list[dict] {szavazokorid, color, geometry} — szkid szerint összevont al-cellák
+      cells : list[dict] {szavazokorid, color, geometry} — MINDEN levágott Voronoi-cella (debug)
+      edges : list[LineString]                           — egyszerűsített vágóélek (debug)
     '''
 
-    counts = points_inside["szavazokorid"].dropna().value_counts()
+    seeds = [(row.geometry, row["szavazokorid"], row["color"])
+             for _, row in points_inside.iterrows()]
+    mp = MultiPoint([pt for pt, _, _ in seeds])
 
-    if len(counts) < 2:
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
+    # 1) Voronoi-territóriumok a magokra (a cella bbox-ára kiterjesztve), majd cellára vágva
+    regions = list(voronoi_diagram(mp, envelope=polygon_geom).geoms)
 
-    szkid_A = counts.index[0]
-    szkid_B = counts.index[1]
+    cells = []
+    for reg in regions:
+        for part in _extract_polys(reg.intersection(polygon_geom)):
+            # a territóriumot birtokló mag a benne lévő pont (Voronoi-tulajdonság);
+            # FP-biztos tartalék: a legközelebbi mag
+            owner = None
+            for s in seeds:
+                if part.covers(s[0]):
+                    owner = s
+                    break
+            if owner is None:
+                owner = min(seeds, key=lambda s: part.distance(s[0]))
+            _, szkid, color = owner
+            cells.append({"szavazokorid": szkid, "color": color, "geometry": part})
 
-    if counts.iloc[0] < LINEAR_SPLIT_MIN_POINTS_PER_CLASS or counts.iloc[1] < LINEAR_SPLIT_MIN_POINTS_PER_CLASS:
-        print(f"[linear_split] elutasítva (túl kevés pont a top-2 szkid valamelyikén: {counts.iloc[0]}/{counts.iloc[1]})")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
+    # 2) azonos szkid-ű territóriumok összevonása (dissolve) -> pontos al-cellák
+    by_szkid = {}
+    for c in cells:
+        by_szkid.setdefault((c["szavazokorid"], c["color"]), []).append(c["geometry"])
+    exact_subcells = []  # (szkid, color, geom)
+    for (szkid, color), geoms in by_szkid.items():
+        for part in _extract_polys(unary_union(geoms)):
+            exact_subcells.append((szkid, color, part))
 
-    train_mask = points_inside["szavazokorid"].isin([szkid_A, szkid_B])
-    train_pts = points_inside.loc[train_mask]
-    coords = np.array([(g.x, g.y) for g in train_pts.geometry], dtype=float)
-    labels = (train_pts["szavazokorid"].values == szkid_B).astype(int)
+    color_of = {s: c for _, s, c in seeds}
 
-    mean_x = float(coords[:, 0].mean())
-    mean_y = float(coords[:, 1].mean())
-    X_centered = coords - np.array([mean_x, mean_y])
+    # 3) pontos belső vágóhálózat = a különböző szkid-ű al-cellák közös határa
+    raw = []
+    for i in range(len(exact_subcells)):
+        for j in range(i + 1, len(exact_subcells)):
+            if exact_subcells[i][0] == exact_subcells[j][0]:
+                continue
+            shared = exact_subcells[i][2].boundary.intersection(exact_subcells[j][2].boundary)
+            raw += _extract_lines(shared)
+    cut_lines = _merge_lines(raw)
 
-    try:
-        svc = LinearSVC(
-            class_weight="balanced",
-            max_iter=LINEAR_SPLIT_MAX_ITER_SVC,
-            random_state=LINEAR_SPLIT_RANDOM_STATE,
-            dual="auto",
-        )
-        svc.fit(X_centered, labels)
-    except Exception as e:
-        print(f"[linear_split] elutasítva (SVC hiba: {e})")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
+    # ha nincs belső vágás (gyakorlatilag egy szkid) -> a pontos al-cellák a kimenet
+    if not cut_lines:
+        rows = [{"szavazokorid": s, "color": c, "geometry": g} for s, c, g in exact_subcells]
+        return rows, cells, []
 
-    w = svc.coef_[0]
-    b = float(svc.intercept_[0])
-    w0, w1 = float(w[0]), float(w[1])
-
-    if abs(w0) < 1e-12 and abs(w1) < 1e-12:
-        print("[linear_split] elutasítva (degenerált szeparátor)")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
-
+    # 4) osztály-megőrző egyszerűsítés: a LEGNAGYOBB tolerancia, amelynél MINDEN pont a
+    #    saját szkid-oldalán marad. Douglas–Peucker (végpontok rögzítve), a toleranciát
+    #    cellánként bináris kereséssel hangoljuk.
+    boundary = polygon_geom.boundary
     minx, miny, maxx, maxy = polygon_geom.bounds
-    diag = ((maxx - minx) ** 2 + (maxy - miny) ** 2) ** 0.5
-    ext = max(diag * 10, 100.0)
+    t_max = ((maxx - minx) ** 2 + (maxy - miny) ** 2) ** 0.5
 
-    if abs(w1) >= abs(w0):
-        x1c, x2c = -ext, ext
-        y1c = -(w0 * x1c + b) / w1
-        y2c = -(w0 * x2c + b) / w1
-    else:
-        y1c, y2c = -ext, ext
-        x1c = -(w1 * y1c + b) / w0
-        x2c = -(w1 * y2c + b) / w0
+    def _build_pieces(tol):
+        simp = []
+        for ln in cut_lines:
+            s = ln.simplify(tol, preserve_topology=True) if tol > 0 else ln
+            if not s.is_empty:
+                simp.append(_extend_boundary_ends(s, boundary, 1.0))
+        if not simp:
+            return []
+        pieces = []
+        for f in polygonize(unary_union([boundary] + simp)):
+            pieces += _extract_polys(f.intersection(polygon_geom))
+        return pieces
 
-    p1 = (x1c + mean_x, y1c + mean_y)
-    p2 = (x2c + mean_x, y2c + mean_y)
-    vago = LineString([p1, p2])
+    def _assign(pieces):
+        # minden magot pontosan egy darabhoz rendel; None, ha bármelyik darab kevert szkid-ű
+        piece_szk = [set() for _ in pieces]
+        for pt, s, _ in seeds:
+            owner = None
+            for k, pc in enumerate(pieces):
+                if pc.contains(pt):
+                    owner = k
+                    break
+            if owner is None:
+                owner = min(range(len(pieces)), key=lambda k: pieces[k].distance(pt))
+            piece_szk[owner].add(s)
+        if any(len(ss) > 1 for ss in piece_szk):
+            return None
+        return piece_szk
 
-    try:
-        result = split(polygon_geom, vago)
-        parts = [make_valid(g) for g in result.geoms if g.geom_type == "Polygon" and not g.is_empty]
-    except Exception as e:
-        print(f"[linear_split] elutasítva (split hiba: {e})")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
+    lo, hi, best_tol = 0.0, t_max, 0.0
+    for _ in range(18):
+        mid = (lo + hi) / 2.0
+        pieces = _build_pieces(mid)
+        if pieces and _assign(pieces) is not None:
+            best_tol = mid
+            lo = mid
+        else:
+            hi = mid
 
-    if len(parts) < 2:
-        print("[linear_split] elutasítva (vonal nem vágta ketté a poligont)")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
+    # 5) végső al-cellák a legjobb toleranciával (tol=0 mindig tiszta -> mindig van megoldás)
+    pieces = _build_pieces(best_tol)
+    piece_szk = _assign(pieces)
+    if piece_szk is None:
+        pieces = _build_pieces(0.0)
+        piece_szk = _assign(pieces)
 
-    pos_parts, neg_parts = [], []
-    for g in parts:
-        c = g.representative_point()
-        sign_val = w0 * (c.x - mean_x) + w1 * (c.y - mean_y) + b
-        (pos_parts if sign_val >= 0 else neg_parts).append(g)
+    final_by_szkid = {}
+    for pc, ss in zip(pieces, piece_szk):
+        szkid = next(iter(ss)) if ss else min(seeds, key=lambda s: pc.distance(s[0]))[1]
+        final_by_szkid.setdefault(szkid, []).append(pc)
 
-    if not pos_parts or not neg_parts:
-        print("[linear_split] elutasítva (minden darab azonos oldalra esett)")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
+    rows = []
+    for szkid, geoms in final_by_szkid.items():
+        for part in _extract_polys(unary_union(geoms)):
+            rows.append({"szavazokorid": szkid, "color": color_of.get(szkid), "geometry": part})
 
-    side_pos = unary_union(pos_parts) if len(pos_parts) > 1 else pos_parts[0]
-    side_neg = unary_union(neg_parts) if len(neg_parts) > 1 else neg_parts[0]
+    # 6) egyszerűsített vágóélek (voronoi_elek debug) a végső al-cellákból
+    raw2 = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            if rows[i]["szavazokorid"] == rows[j]["szavazokorid"]:
+                continue
+            shared = rows[i]["geometry"].boundary.intersection(rows[j]["geometry"].boundary)
+            raw2 += _extract_lines(shared)
+    edges = _merge_lines(raw2)
 
-    maj_p, n_p, second_p, color_p = _besorol_oldalra(points_inside, side_pos)
-    maj_n, n_n, second_n, color_n = _besorol_oldalra(points_inside, side_neg)
-
-    def _oldal_elfogadhato(majority_count, second_count):
-        if majority_count == 0:
-            return True
-        if majority_count < LINEAR_SPLIT_MIN_ABS_MAJORITY:
-            return False
-        if second_count == 0:
-            return True
-        return (majority_count / second_count) >= min_margin
-
-    ok_pos = _oldal_elfogadhato(n_p, second_p)
-    ok_neg = _oldal_elfogadhato(n_n, second_n)
-
-    if not (ok_pos and ok_neg):
-        ratio_p = (n_p / max(second_p, 1)) if n_p > 0 else 0
-        ratio_n = (n_n / max(second_n, 1)) if n_n > 0 else 0
-        print(f"[linear_split] elutasítva (margó nem elég: pos {n_p}/{second_p}={ratio_p:.2f}, neg {n_n}/{second_n}={ratio_n:.2f})")
-        return _osszes_szkid_tobbsegre(polygon_geom, points_inside)
-
-    ratio_p = (n_p / max(second_p, 1)) if n_p > 0 else float("inf")
-    ratio_n = (n_n / max(second_n, 1)) if n_n > 0 else float("inf")
-    print(f"[linear_split] elfogadva (pos {n_p}/{second_p}={ratio_p}, neg {n_n}/{second_n}={ratio_n})")
-
-    return [
-        {"szavazokorid": maj_p, "color": color_p, "geometry": side_pos},
-        {"szavazokorid": maj_n, "color": color_n, "geometry": side_neg},
-    ]
+    return rows, cells, edges
 
 
 def ures_polyk_besorolasa(results):
@@ -402,6 +474,73 @@ def rebuild_coverage(gdf):
             "geometry": cell,
         })
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=gdf.crs)
+
+
+def hibas_szigetek_torlese(results, gdf, min_cimek=1):
+    '''
+    Végső adattisztítás: az egyesítés után különálló szigetekké váló, hibás
+    forrásadat miatt keletkező EGY-CÍMES szavazókör-szigetek eltüntetése.
+
+    Háttér: néhol egy koordinátához rossz cím → rossz szavazokorid van rendelve.
+    Ez a coverage egyetlen celláját rossz szkid-hez sorolja, ami az egyesítés
+    után a szavazókör távoli, EGYETLEN címet tartalmazó szigeteként jelenik meg
+    (egy másik, körülvevő szavazókör területébe ágyazva). A valós, elkülönült
+    szigetek (pl. egy másik szk-hez sorolt utcatömb) több címet tartalmaznak —
+    ezeket nem bántjuk.
+
+    Cella-szinten (még az egyesítés ELŐTT) dolgozik: a hibás szigetek celláinak
+    szkid-jét None-ra állítja, majd az `ures_polyk_besorolasa`-val a leghosszabb
+    közös határú szomszédhoz (= a körülvevő szk) sorolja át őket. A `gdf`
+    címpontokat szándékosan NEM módosítja (a koordináta úgyis hibás).
+    '''
+    if len(results) == 0:
+        return results.copy()
+
+    # A címek 4326-ban vannak, a coverage UTM-ben — egyeztetni kell a .within-hez.
+    if gdf.crs != results.crs:
+        gdf = gdf.to_crs(results.crs)
+    pts = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
+
+    out = results.copy()
+    torolt_szigetek = 0
+    torolt_cellak = 0
+
+    for szkid, grp in out.groupby("szavazokorid", dropna=False):
+        if szkid is None or (isinstance(szkid, float) and pd.isna(szkid)):
+            continue
+
+        parts = _extract_polys(unary_union(list(grp.geometry)))
+        if len(parts) <= 1:
+            # egyetlen összefüggő törzs — nem lehet elszórt hibás sziget
+            continue
+
+        counts = [int(pts.within(part).sum()) for part in parts]
+        bad = [i for i, c in enumerate(counts) if c <= min_cimek]
+
+        # Biztonsági korlát: egy szavazókör ÖSSZES szigetét sosem töröljük.
+        # Ha minden sziget hibásnak minősülne, a legnagyobb területűt megtartjuk.
+        if len(bad) == len(parts):
+            keep = max(range(len(parts)), key=lambda i: parts[i].area)
+            bad = [i for i in bad if i != keep]
+
+        if not bad:
+            continue
+
+        # A hibás szigetekbe eső cellákat kiürítjük (újra-besorolásra jelöljük).
+        for i in bad:
+            part = parts[i]
+            mask = grp.geometry.apply(lambda g: part.contains(g.representative_point()))
+            out.loc[grp.index[mask], "szavazokorid"] = None
+            out.loc[grp.index[mask], "color"] = None
+            torolt_szigetek += 1
+            torolt_cellak += int(mask.sum())
+
+    print(f"[hibas_szigetek_torlese] {torolt_szigetek} egy-címes hibás sziget törölve "
+          f"({torolt_cellak} cella átsorolva a körülvevő szavazókörhöz)")
+
+    # A kiürített cellákat a leghosszabb közös határú címkézett szomszéd nyeli el.
+    out = ures_polyk_besorolasa(out)
+    return out
 
 
 def polygonok_egyesitese(results, **_ignored):
