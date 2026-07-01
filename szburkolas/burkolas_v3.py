@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from polygon_fuggvenyek import *
 from poligon_szk_fuggvenyek import *
 from polygon_io import olvas_varos
+from polir import polir
 
 
 def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.1, debug_path=None):
@@ -66,7 +67,7 @@ def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.
         if len(polygons) > 0:
             polygons.to_file(debug_path, layer="6_nyers_poligonok", driver="GPKG")
 
-    return polygons
+    return polygons, edges
 
 
 
@@ -117,7 +118,7 @@ def generalas_pipeline(VAROS, debug=False, export=True):
 
     # legenerálom (később beolvasom) a beazonosítandó település parcellákat
     try:
-        gdf_szigetek = poly_gen_pipeline(VAROS, debug_path=debug_path)
+        gdf_szigetek, edges = poly_gen_pipeline(VAROS, debug_path=debug_path)
     except NincsResidentialError as e:
         print(f"[{VAROS}] {e} — kihagyom.")
         return None, None
@@ -146,8 +147,12 @@ def generalas_pipeline(VAROS, debug=False, export=True):
     # a kis parcellákat egyesítem egyetelen multypolygonba
     merged = polygonok_egyesitese(results_clean)
 
+    # POLÍR: a kész szkid-poligonok határhálózatának kozmetikai csiszolása az
+    # utcahálózat alapján, osztály-megőrzéssel (utolsó lépés, az export előtt)
+    merged = polir(merged, gdf, edges, debug_path=debug_path)
+
     if export:
-        merged.to_file(f'./adatok/{VAROS}_szigetek_besorolt_4.gpkg', layer='network_polygons', driver='GPKG')
+        merged.to_file(f'./adatok/{VAROS}_szigetek_besorolt_5.gpkg', layer='network_polygons', driver='GPKG')
         gdf.to_file(f'./adatok/{VAROS}_cimek_besorolt.gpkg', layer='network_polygons', driver='GPKG')
 
     return gdf, merged
@@ -155,6 +160,6 @@ def generalas_pipeline(VAROS, debug=False, export=True):
 
 
 if __name__ == "__main__":
-    VAROS = 'Tököl'       # Kétvölgy
+    VAROS = 'Halásztelek'       # Kétvölgy
 
     gdf, gdf_szigetek = generalas_pipeline(VAROS, debug=True)
