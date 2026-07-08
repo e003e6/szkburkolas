@@ -5,7 +5,7 @@ from osm_epulet_pont_egyesites import overpass_feldolgozas
 from gm_feldolgozas import gm_feldolgozas
 from osm_gmaps_egyesites import osm_gmaps_egyesites
 from gm_osm_lekerdezes import gm_osm_lekerdezes
-from szkid_cim_kapcsolas import szkid_cim_kapcsolas
+from szkid_cim_kapcsolas import szkid_cim_kapcsolas, szkid_cim_kapcsolas_v2
 from ms_ures_sample import ms_ures_sample
 from osm_letoltes import osm_letoltes
 
@@ -85,11 +85,23 @@ def pipeline():
     # Összekapcsolom a két fontos adathalmazomat hogy a kordinátákhoz szavazókör id-t tudjak rendelni
     #  Input:
     #    1. osm_gmaps_merged -> koordinátás (anchor) pontok pontos címmel
-    #    2. valasztas_cimek_2022.csv -> választási címjegyzék szavazókör id-vel
+    #    2. nyers választási címjegyzék csv -> címek szavazókör id-vel
     #  Output:
-    #    1. osszekapcsolt_pontok_es_cimek_v2 -> koordinátás pontok szavazokorid-dal feldúsítva
+    #    1. osszekapcsolt_pontok_es_cimek_<év> -> koordinátás pontok szavazokorid-dal feldúsítva
     #       (a burkolas_v3 által módosítás nélkül olvasható séma)
-    szkid_cim_kapcsolas()
+    #  Két bemenet: input címjegyzék + output út/név — más futáshoz csak ezt a kettőt kell cserélni.
+
+    # 2022 cim generalas (2014–2022-es formátum)
+    szkid_cim_kapcsolas('../data/nyers_data/valasztas_cimek_2022.csv',
+                        '../data/work_data/osszekapcsolt_pontok_es_cimek_2022')
+
+    # 2014 cim generalas (erre még nincsen csv)
+    szkid_cim_kapcsolas('../data/nyers_data/valasztas_cimek_2014.csv',
+                        '../data/work_data/osszekapcsolt_pontok_es_cimek_2014')
+
+    # 2026 cim generalas (2026-os formátum, irsz-kulcsos)
+    szkid_cim_kapcsolas_v2('../data/nyers_data/szavkor2026.csv',
+                           '../data/work_data/osszekapcsolt_pontok_es_cimek_2026')
 
 
 if __name__ == '__main__':

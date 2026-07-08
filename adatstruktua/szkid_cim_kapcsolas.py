@@ -1,14 +1,23 @@
 # Választási címjegyzék (attribútum) ↔ koordinátás pontkészlet (OSM+Gmaps) összekapcsolása.
 #
 # Bal oldal (anchor, koordinátás): osm_gmaps_merged.parquet  — minden sornak van geometriája.
-# Jobb oldal (attribútum): valasztas_cimek_2022.csv          — szavazokör id + cím, geometria nélkül.
+# Jobb oldal (attribútum): nyers választási címjegyzék CSV   — szavazokör id + cím, geometria nélkül.
+#   - 2014–2022-es formátum (vesszős CSV) → szkid_cim_kapcsolas()
+#   - 2026-os formátum (TAB-os, irsz-kulcsos) → szkid_cim_kapcsolas_v2()
 # Irány: a koordinátás pontok kapnak szavazokorid-ot. Egy választási címhez több pont is matchelhet.
 #
-# Kimenet (osszekapcsolt_pontok_es_cimek_v2): a burkolas_v3 által módosítás nélkül olvasható séma:
-#   szavazokorid (int), utca (str), hazszam (str), telepules (str), geometry (Point, EPSG:4326)
+# Mindkét függvénynek KÉT bemenete van: elect_csv (nyers címjegyzék) és out_path (kimenet
+# útja+neve) — más futáshoz csak ezt a kettőt kell cserélni.
+# Kimenet (<out_path>.gpkg/.parquet): a burkolas_v3 által módosítás nélkül olvasható séma:
+#   szavazokorid (int), utca (str), hazszam (str), telepules (str), irsz (str), geometry (Point, EPSG:4326)
+#   telepules: Budapesten kerületnév ("Budapest I. kerület" ... "Budapest XXIII. kerület",
+#              pontosan a varosok.txt-beli alak — a burkolás erre a névre szűr).
+#   irsz: az anchor-oldali normalizált irányítószám; a 2026-os úton mindig 4 jegyű (illesztő-kulcs),
+#         a régi (2022) úton nem-budapesti pontnál lehet "" (ott nem illesztési kulcs).
 
 import os
 import re
+import csv
 
 import numpy as np
 import pandas as pd
@@ -24,11 +33,6 @@ pd.set_option("future.no_silent_downcasting", True)
 # Útvonalak
 # ----------------------------------------------------------------------------------------
 COORD_PATH = "../data/work_data/osm_gmaps_merged.parquet"
-ELECT_PATH = "../data/nyers_data/valasztas_cimek_2022.csv"
-
-OUT_GPKG = "../data/work_data/osszekapcsolt_pontok_es_cimek_v2.gpkg"
-OUT_PARQUET = "../data/work_data/osszekapcsolt_pontok_es_cimek_v2.parquet"
-DEBUG_GPKG = "../data/test_data/szkid_match_debug.gpkg"
 QA_DIR = "../data/work_data/qa"
 
 # QA-ban használt metrikus vetület (EOV) a centroid-távolsághoz
@@ -70,9 +74,29 @@ def _roman_to_int(s):
     return total
 
 
-# Várt forma: "Budapest XVII. kerület" (a CSV adatjavítás utáni alakja).
-# Defenzíven elfogadunk hiányzó "Budapest " prefixet és arab számokat is.
-_KERULET_RE = re.compile(r"(?:budapest\s+)?([ivxlcdm]+|\d+)\.?\s*kerulet$")
+# Budapest 23 kerületének kanonikus neve — PONTOSAN a varosok.txt-beli alak
+# (a burkolás oldala erre a névre szűr, az egyezést az önteszt is ellenőrzi).
+_BP_ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII",
+             "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX", "XXI", "XXII", "XXIII"]
+BP_KERULET_NEV = {n: f"Budapest {r}. kerület" for n, r in enumerate(_BP_ROMAN, start=1)}
+
+
+def kerulet_nev(n):
+    """Kerületszám (1..23) → kanonikus kerületnév; minden másra (None/NA/0/24...) None."""
+    try:
+        return BP_KERULET_NEV.get(int(n))
+    except (TypeError, ValueError):
+        return None
+
+
+# Várt formák (unidecode + lower után):
+#   "budapest xvii. kerulet" / "xvii. kerulet" / "17. kerulet"  (2022-es alak + defenzív)
+#   "budapest xvii" / "budapest 17"                             (2026-os telepnev, nincs utótag)
+# Puszta "xvii" (se prefix, se utótag) szándékosan NEM kerület.
+_KERULET_RE = re.compile(
+    r"^(?:budapest\s+([ivxlcdm]+|\d+)\.?(?:\s*kerulet)?"
+    r"|([ivxlcdm]+|\d+)\.?\s*kerulet)$"
+)
 
 
 def kerulet_from_telepules_nev(s):
@@ -84,7 +108,7 @@ def kerulet_from_telepules_nev(s):
     m = _KERULET_RE.match(t)
     if not m:
         return None
-    tok = m.group(1)
+    tok = m.group(1) or m.group(2)
     n = int(tok) if tok.isdigit() else _roman_to_int(tok)
     return n if (n is not None and 1 <= n <= 23) else None
 
@@ -98,6 +122,15 @@ def kerulet_from_postcode(s):
         return None
     n = int(t[1:3])
     return n if 1 <= n <= 23 else None
+
+
+def irsz_norm(s):
+    """Irányítószám kanonikus alak: pontosan 4 számjegy → string, különben "".
+    Mindkét oldalon ugyanez (anchor postcode ↔ választási pir) az illesztés szimmetriájáért."""
+    if s is None:
+        return ""
+    t = str(s).strip()
+    return t if (len(t) == 4 and t.isdigit()) else ""
 
 
 def telepules_fp(s):
@@ -233,6 +266,7 @@ def betolt_koordinatas(path=COORD_PATH):
     c = c.rename(columns={"street": "utca", "housenumber": "hazszam", "city": "telepules"})
     c["telepules_fp"] = _telepules_fp_col(c["telepules"])
     c["utca_fp"] = utca_fp_series(c["utca"])
+    c["irsz"] = c["postcode"].map(irsz_norm)  # v2 (2026) illesztéshez; a régi út nem használja
 
     ker = c["postcode"].map(kerulet_from_postcode)
     bp_mask = (c["telepules_fp"] == "budapest")
@@ -252,7 +286,7 @@ def betolt_koordinatas(path=COORD_PATH):
     return c
 
 
-def betolt_valasztasi(path=ELECT_PATH):
+def betolt_valasztasi(path):
     """Választási (attribútum) oldal betöltése, normalizálás + dedup."""
     e = pd.read_csv(
         path,
@@ -277,8 +311,11 @@ def betolt_valasztasi(path=ELECT_PATH):
 
     e = _hnum_columns(e, "hazszam")
 
-    # kimeneti településnév: Budapest-egységesítés
-    e["telepules_out"] = np.where(e["telepules_fp"] == "budapest", "Budapest", e["telepules_nev"])
+    # kimeneti településnév: Budapest → kanonikus kerületnév (varosok.txt-vel egyező alak);
+    # NA-kerületes BP-sor "Budapest" marad (a _valid_mask a matchingből úgyis kizárja)
+    e["telepules_out"] = np.where(
+        bp_mask, e["kerulet_fp"].map(BP_KERULET_NEV).fillna("Budapest"), e["telepules_nev"]
+    )
 
     # dedup az egyedi (szavazokör, fingerprint, kerület, házszám) kulcsra
     e = e.drop_duplicates(
@@ -288,15 +325,79 @@ def betolt_valasztasi(path=ELECT_PATH):
     return e
 
 
-def _valid_mask(df):
-    return (
+def betolt_valasztasi_v2(path):
+    """2026-os választási címjegyzék betöltése + normalizálás + dedup.
+
+    Eltérések a régi formátumtól (valasztas_cimek_2022.csv):
+      - TAB-tagolt, idézőjel nélküli fájl (nem vesszős/idézett),
+      - az utcanév két oszlopra bontva: kozteruletnev + kozteruletjelleg,
+      - ÚJ: pir = irányítószám (irsz), ezt szigorú illesztő-kulcsként használjuk,
+      - a szavazókör id a wardid oszlop.
+    A fingerprint/házszám-normalizálás és a Budapest-egységesítés a régivel közös.
+    """
+    e = pd.read_csv(
+        path,
+        sep="\t",
+        quoting=csv.QUOTE_NONE,
+        dtype=str,
+        keep_default_na=False,
+        usecols=["telepnev", "pir", "kozteruletnev", "kozteruletjelleg", "hazszam", "wardid"],
+    )
+
+    e["szavazokor_id"] = e["wardid"].astype("int64")
+    e["telepules_nev"] = e["telepnev"]
+    e["utca_nev"] = (e["kozteruletnev"].str.strip() + " " + e["kozteruletjelleg"].str.strip()).str.strip()
+    e["irsz"] = e["pir"].map(irsz_norm)
+
+    e["telepules_fp"] = _telepules_fp_col(e["telepules_nev"])
+    e["utca_fp"] = utca_fp_series(e["utca_nev"])
+
+    # kerület: a telepnev az irányadó ("Budapest XII" — hiteles), a pir fallback +
+    # keresztellenőrzés. A kerulet_fp adja a kimeneti kerületnevet (telepules_out)
+    # és a QA kerület-bontását is.
+    ker_nev = e["telepules_nev"].map(
+        {v: kerulet_from_telepules_nev(v) for v in e["telepules_nev"].unique()})
+    ker_pir = e["pir"].map(kerulet_from_postcode)
+    ker = ker_nev.where(ker_nev.notna(), ker_pir)
+    bp_mask = (e["telepules_fp"] == "budapest")
+    mism = bp_mask & ker_nev.notna() & ker_pir.notna() & (ker_nev != ker_pir)
+    print(f"  [valasztas 2026] Budapest sorok: {int(bp_mask.sum())}, "
+          f"név-kerület nélkül: {int((bp_mask & ker_nev.isna()).sum())}, "
+          f"telepnev↔pir kerület-eltérés: {int(mism.sum())}")
+    if mism.any():
+        print(e.loc[mism, ["telepules_nev", "pir"]].value_counts().head(10).to_string())
+    e["kerulet_fp"] = pd.Series(pd.NA, index=e.index, dtype="Int8")
+    e.loc[bp_mask, "kerulet_fp"] = ker[bp_mask].astype("Int8")
+    e.loc[~bp_mask, "kerulet_fp"] = pd.Series(0, index=e.index, dtype="Int8")[~bp_mask]
+
+    e = _hnum_columns(e, "hazszam")
+
+    # kimeneti településnév: Budapest → kanonikus kerületnév (varosok.txt-vel egyező alak)
+    e["telepules_out"] = np.where(
+        bp_mask, e["kerulet_fp"].map(BP_KERULET_NEV).fillna("Budapest"), e["telepules_nev"]
+    )
+
+    # dedup az egyedi (szavazokör, fingerprint, irsz, házszám) kulcsra
+    e = e.drop_duplicates(
+        subset=["szavazokor_id", "telepules_fp", "irsz", "utca_fp",
+                "hnum_lo", "hnum_hi", "hnum_letter_key"]
+    ).reset_index(drop=True)
+    return e
+
+
+def _valid_mask(df, geo_keys=("telepules_fp", "kerulet_fp")):
+    m = (
         (~df["empty_housenumber"])
         & (~df["is_hrsz"])
         & df["hnum_lo"].notna()
-        & (df["telepules_fp"] != "")
         & (df["utca_fp"] != "")
-        & df["kerulet_fp"].notna()
     )
+    for k in geo_keys:
+        if k == "kerulet_fp":
+            m &= df["kerulet_fp"].notna()
+        else:  # string-fingerprint (telepules_fp, irsz, ...): nem üres kell legyen
+            m &= df[k].notna() & (df[k].astype(str) != "")
+    return m
 
 
 # ========================================================================================
@@ -306,13 +407,12 @@ def _valid_mask(df):
 _CAND_COLS = ["cid", "eid", "szavazokor_id", "telepules_out"]
 
 
-def _e_frame(e_valid):
+def _e_frame(e_valid, geo_keys=("telepules_fp", "kerulet_fp")):
     """Választási oldal join-frame egyértelmű oszlopnevekkel + sor-azonosító (eid)."""
-    E = e_valid[[
-        "eid", "telepules_fp", "kerulet_fp", "utca_fp",
-        "hnum_lo", "hnum_hi", "hnum_letter_key",
-        "szavazokor_id", "telepules_out",
-    ]].rename(columns={
+    cols = ["eid", *geo_keys, "utca_fp",
+            "hnum_lo", "hnum_hi", "hnum_letter_key",
+            "szavazokor_id", "telepules_out"]
+    E = e_valid[cols].rename(columns={
         "hnum_lo": "e_lo", "hnum_hi": "e_hi", "hnum_letter_key": "e_letter_key",
     }).astype({"e_lo": "int64", "e_hi": "int64"})
     return E
@@ -340,69 +440,78 @@ def _resolve(cand, rule):
 # a koordináta-hozzárendelést (cid-enként 1 szavazókör) ÉS a választási lefedettséget (mely
 # választási sorokat ér el legalább 1 koordináta).
 
-def _cand_exact(C, E):
+def _cand_exact(C, E, geo_keys=("telepules_fp", "kerulet_fp")):
+    gk = list(geo_keys) + ["utca_fp"]
     m = C.merge(
         E,
-        left_on=["telepules_fp", "kerulet_fp", "utca_fp", "hnum_lo", "hnum_hi", "hnum_letter_key"],
-        right_on=["telepules_fp", "kerulet_fp", "utca_fp", "e_lo", "e_hi", "e_letter_key"],
+        left_on=gk + ["hnum_lo", "hnum_hi", "hnum_letter_key"],
+        right_on=gk + ["e_lo", "e_hi", "e_letter_key"],
         how="inner",
     )
     return m[_CAND_COLS]
 
 
-def _cand_range_point(C, E):
+def _cand_range_point(C, E, geo_keys=("telepules_fp", "kerulet_fp")):
+    gk = list(geo_keys) + ["utca_fp"]
     rows = []
     cp = C[C["hnum_lo"] == C["hnum_hi"]]
     er = E[E["e_lo"] < E["e_hi"]]
     if len(cp) and len(er):
-        m = cp.merge(er, on=["telepules_fp", "kerulet_fp", "utca_fp"], how="inner")
+        m = cp.merge(er, on=gk, how="inner")
         ok = (m["e_lo"] <= m["hnum_lo"]) & (m["hnum_lo"] <= m["e_hi"]) & (m["hnum_letter_key"] == m["e_letter_key"])
         rows.append(m[ok][_CAND_COLS])
     # szimmetrikus: koordinátás tartomány ↔ választási pont (ritka)
     cr = C[C["hnum_lo"] < C["hnum_hi"]]
     ep = E[E["e_lo"] == E["e_hi"]]
     if len(cr) and len(ep):
-        m = cr.merge(ep, on=["telepules_fp", "kerulet_fp", "utca_fp"], how="inner")
+        m = cr.merge(ep, on=gk, how="inner")
         ok = (m["hnum_lo"] <= m["e_lo"]) & (m["e_lo"] <= m["hnum_hi"]) & (m["hnum_letter_key"] == m["e_letter_key"])
         rows.append(m[ok][_CAND_COLS])
     return pd.concat(rows, ignore_index=True) if rows else _empty_cand()
 
 
-def _cand_range_overlap(C, E):
+def _cand_range_overlap(C, E, geo_keys=("telepules_fp", "kerulet_fp")):
+    gk = list(geo_keys) + ["utca_fp"]
     cr = C[C["hnum_lo"] < C["hnum_hi"]]
     er = E[E["e_lo"] < E["e_hi"]]
     if not (len(cr) and len(er)):
         return _empty_cand()
-    m = cr.merge(er, on=["telepules_fp", "kerulet_fp", "utca_fp"], how="inner")
+    m = cr.merge(er, on=gk, how="inner")
     ok = (m[["hnum_lo", "e_lo"]].max(axis=1) <= m[["hnum_hi", "e_hi"]].min(axis=1)) \
         & (m["hnum_letter_key"] == m["e_letter_key"])
     return m[ok][_CAND_COLS]
 
 
-def _cand_letter_collapse(C, E):
+def _cand_letter_collapse(C, E, geo_keys=("telepules_fp", "kerulet_fp")):
+    gk = list(geo_keys) + ["utca_fp"]
     cp = C[C["hnum_lo"] == C["hnum_hi"]]
     ep = E[E["e_lo"] == E["e_hi"]]
     if not (len(cp) and len(ep)):
         return _empty_cand()
-    m = cp.merge(ep, left_on=["telepules_fp", "kerulet_fp", "utca_fp", "hnum_lo"],
-                 right_on=["telepules_fp", "kerulet_fp", "utca_fp", "e_lo"], how="inner")
+    m = cp.merge(ep, left_on=gk + ["hnum_lo"],
+                 right_on=gk + ["e_lo"], how="inner")
     return m[_CAND_COLS]
 
 
-def _cand_hnum_tolerance(C, E, tol):
+def _cand_hnum_tolerance(C, E, tol, geo_keys=("telepules_fp", "kerulet_fp")):
+    gk = list(geo_keys) + ["utca_fp"]
     cp = C[C["hnum_lo"] == C["hnum_hi"]]
     ep = E[E["e_lo"] == E["e_hi"]]
     if not (len(cp) and len(ep)):
         return _empty_cand()
-    m = cp.merge(ep, on=["telepules_fp", "kerulet_fp", "utca_fp"], how="inner")
+    m = cp.merge(ep, on=gk, how="inner")
     diff = (m["hnum_lo"] - m["e_lo"]).abs()
     m = m[diff <= tol]
     return m[_CAND_COLS]
 
 
 def cim_matcher(coord, elect, rules=("exact", "range_point", "range_overlap"),
-                hnum_tolerance=2, cardinality="many_to_many"):
+                hnum_tolerance=2, cardinality="many_to_many",
+                geo_keys=("telepules_fp", "kerulet_fp")):
     """Kétirányú matching kaszkád.
+
+    geo_keys: a geo-diszkriminátor join-kulcsok az utca/házszám mellé. Default a régi
+      (telepules_fp, kerulet_fp); a 2026-os v2 (telepules_fp, irsz) — szigorú irsz.
 
     Visszaad:
       matched          – koordinátás pontonként (cid) 1 szavazókör
@@ -410,23 +519,23 @@ def cim_matcher(coord, elect, rules=("exact", "range_point", "range_overlap"),
       matched_eids     – azon választási sorok (eid) halmaza, amelyeket legalább 1 koordináta elér
       e_valid          – a matchelhető (valid) választási sorok eid + telepules_out-tal
     """
-    c_valid = coord[_valid_mask(coord)].copy()
-    e_valid = elect[_valid_mask(elect)].copy()
+    c_valid = coord[_valid_mask(coord, geo_keys)].copy()
+    e_valid = elect[_valid_mask(elect, geo_keys)].copy()
     for col in ("hnum_lo", "hnum_hi"):
         c_valid[col] = c_valid[col].astype("int64")
     e_valid["eid"] = np.arange(len(e_valid), dtype=np.int64)
 
-    E = _e_frame(e_valid)
-    c_cols = ["cid", "telepules_fp", "kerulet_fp", "utca_fp",
+    E = _e_frame(e_valid, geo_keys)
+    c_cols = ["cid", *geo_keys, "utca_fp",
               "hnum_lo", "hnum_hi", "hnum_letter_key"]
     C_full = c_valid[c_cols]
 
     dispatch = {
-        "exact": lambda C: _cand_exact(C, E),
-        "range_point": lambda C: _cand_range_point(C, E),
-        "range_overlap": lambda C: _cand_range_overlap(C, E),
-        "letter_collapse": lambda C: _cand_letter_collapse(C, E),
-        "hnum_tolerance": lambda C: _cand_hnum_tolerance(C, E, hnum_tolerance),
+        "exact": lambda C: _cand_exact(C, E, geo_keys),
+        "range_point": lambda C: _cand_range_point(C, E, geo_keys),
+        "range_overlap": lambda C: _cand_range_overlap(C, E, geo_keys),
+        "letter_collapse": lambda C: _cand_letter_collapse(C, E, geo_keys),
+        "hnum_tolerance": lambda C: _cand_hnum_tolerance(C, E, hnum_tolerance, geo_keys),
     }
 
     matched_parts = []
@@ -537,15 +646,10 @@ def valasztasi_lefedettseg_report(elect, e_valid, matched_eids):
     n_covered = len(matched_eids)
     n_skipped = n_all - n_valid
 
-    cov = e_valid[["eid", "telepules_out", "kerulet_fp"]].copy()
+    cov = e_valid[["eid", "telepules_out"]].copy()
     cov["covered"] = cov["eid"].isin(matched_eids)
-    # Budapest QA-ban kerületenként bontva (export-séma változatlan marad)
-    cov["telepules_qa"] = np.where(
-        cov["telepules_out"] == "Budapest",
-        "Budapest " + cov["kerulet_fp"].astype("string") + ". kerület",
-        cov["telepules_out"],
-    )
-    per_tel = cov.groupby("telepules_qa").agg(
+    # a telepules_out Budapesten már kerületnév ("Budapest N. kerület") — külön QA-bontás nem kell
+    per_tel = cov.groupby("telepules_out").agg(
         valasztasi_cim=("eid", "size"),
         lefedett=("covered", "sum"),
     )
@@ -574,12 +678,13 @@ def _build_outputs(coord, matched):
     enr = coord.merge(matched, on="cid", how="left")
     enr["geom_outlier"] = enr["cid"].map(geom_outlier).fillna(False).astype(bool)
 
-    matched_rows = enr[enr["szavazokor_id"].notna()].copy()
+    matched_rows = enr[enr["szavazokor_id"].notna()].reset_index(drop=True)
     v2 = gpd.GeoDataFrame({
         "szavazokorid": matched_rows["szavazokor_id"].astype("int64"),
         "utca": matched_rows["utca"].astype(str),
         "hazszam": matched_rows["hazszam"].astype(str),
         "telepules": matched_rows["telepules_out"].astype(str),
+        "irsz": matched_rows["irsz"].astype(str),
         "geometry": matched_rows["geometry"].values,
     }, geometry="geometry", crs="EPSG:4326")
 
@@ -589,6 +694,7 @@ def _build_outputs(coord, matched):
         "hazszam": enr["hazszam"].astype(str),
         "telepules": enr["telepules"].astype(str),
         "telepules_fp": enr["telepules_fp"],
+        "irsz": enr["irsz"].astype(str),
         "utca_fp": enr["utca_fp"],
         "match_rule": enr["match_rule"].fillna("unmatched"),
         "ambiguous": enr["ambiguous"].fillna(False).astype(bool),
@@ -601,18 +707,41 @@ def _build_outputs(coord, matched):
     return v2, debug
 
 
+def _export_outputs(v2, debug, out_path):
+    """Kimenetek kiírása az out_path törzs alapján: <out>.gpkg, <out>.parquet, <out>_debug.gpkg.
+    Az out_path megadható kiterjesztés nélkül vagy .gpkg-vel — mindkettő ugyanoda ír."""
+    base = str(out_path)
+    if base.endswith(".gpkg"):
+        base = base[:-5]
+    out_gpkg, out_parquet, debug_gpkg = base + ".gpkg", base + ".parquet", base + "_debug.gpkg"
+    os.makedirs(os.path.dirname(out_gpkg) or ".", exist_ok=True)
+    v2.to_file(out_gpkg, layer="points", driver="GPKG")
+    v2.to_parquet(out_parquet)
+    debug.to_file(debug_gpkg, layer="points", driver="GPKG")
+    print(f"  kiírva: {out_gpkg}")
+    print(f"  kiírva: {out_parquet}")
+    print(f"  kiírva: {debug_gpkg}")
+
+
 # ========================================================================================
 # Fő belépési pont
 # ========================================================================================
 
-def szkid_cim_kapcsolas(rules=("exact", "range_point", "range_overlap", "letter_collapse"),
+def szkid_cim_kapcsolas(elect_csv, out_path,
+                        rules=("exact", "range_point", "range_overlap", "letter_collapse"),
                         hnum_tolerance=2, cardinality="many_to_many", export=True):
+    """A 2014–2022-es formátumú (vesszős CSV) választási címjegyzék összekapcsolása.
+
+    elect_csv — a nyers címjegyzék CSV útja (pl. ../data/nyers_data/valasztas_cimek_2022.csv).
+    out_path  — a kimenet útja és neve (pl. ../data/work_data/osszekapcsolt_pontok_es_cimek_2022);
+                ebből lesz <out>.gpkg, <out>.parquet és <out>_debug.gpkg.
+    """
     print("Koordinátás oldal betöltése...")
     coord = betolt_koordinatas()
     print(f"  koordinátás pontok: {len(coord)}")
 
     print("Választási oldal betöltése + normalizálás + dedup...")
-    elect = betolt_valasztasi()
+    elect = betolt_valasztasi(path=elect_csv)
     print(f"  egyedi választási cím: {len(elect)}")
 
     print(f"Matching kaszkád: {rules}")
@@ -626,17 +755,53 @@ def szkid_cim_kapcsolas(rules=("exact", "range_point", "range_overlap", "letter_
     valasztasi_lefedettseg_report(elect, e_valid, matched_eids)
 
     v2, debug = _build_outputs(coord, matched)
-    print(f"v2 kimeneti sorok (matched): {len(v2)}")
+    print(f"kimeneti sorok (matched): {len(v2)}")
 
     if export:
-        os.makedirs(os.path.dirname(OUT_GPKG), exist_ok=True)
-        os.makedirs(os.path.dirname(DEBUG_GPKG), exist_ok=True)
-        v2.to_file(OUT_GPKG, layer="points", driver="GPKG")
-        v2.to_parquet(OUT_PARQUET)
-        debug.to_file(DEBUG_GPKG, layer="points", driver="GPKG")
-        print(f"  kiírva: {OUT_GPKG}")
-        print(f"  kiírva: {OUT_PARQUET}")
-        print(f"  kiírva: {DEBUG_GPKG}")
+        _export_outputs(v2, debug, out_path)
+
+    return v2, debug
+
+
+def szkid_cim_kapcsolas_v2(elect_csv, out_path,
+                           rules=("exact", "range_point", "range_overlap", "letter_collapse"),
+                           hnum_tolerance=2, cardinality="many_to_many", export=True):
+    """A 2026-os formátumú (TAB-os) választási címjegyzék összekapcsolása.
+
+    elect_csv — a nyers címjegyzék útja (pl. ../data/nyers_data/szavkor2026.csv).
+    out_path  — a kimenet útja és neve (pl. ../data/work_data/osszekapcsolt_pontok_es_cimek_2026);
+                ebből lesz <out>.gpkg, <out>.parquet és <out>_debug.gpkg.
+
+    Eltérés a szkid_cim_kapcsolas()-tól:
+      - a választási oldalt a betolt_valasztasi_v2() olvassa (TAB-formátum, wardid, pir),
+      - az illesztés SZIGORÚ irányítószám-kulccsal megy: geo_keys=("telepules_fp", "irsz"),
+        vagyis település → irányítószám → utca → házszám hierarchia.
+    """
+    print("Koordinátás oldal betöltése...")
+    coord = betolt_koordinatas()
+    print(f"  koordinátás pontok: {len(coord)}")
+
+    print("Választási oldal (2026-os formátum) betöltése + normalizálás + dedup...")
+    elect = betolt_valasztasi_v2(path=elect_csv)
+    print(f"  egyedi választási cím: {len(elect)}")
+
+    geo_keys = ("telepules_fp", "irsz")
+    print(f"Matching kaszkád: {rules} | geo-kulcs: {geo_keys}")
+    matched, unmatched_cids, matched_eids, e_valid = cim_matcher(
+        coord, elect, rules=rules, hnum_tolerance=hnum_tolerance,
+        cardinality=cardinality, geo_keys=geo_keys)
+
+    print("QA...")
+    coverage_report(coord, matched, unmatched_cids)
+    match_rule_ratio(coord, matched)
+    unmatched_report(coord, unmatched_cids)
+    valasztasi_lefedettseg_report(elect, e_valid, matched_eids)
+
+    v2, debug = _build_outputs(coord, matched)
+    print(f"kimeneti sorok (matched): {len(v2)}")
+
+    if export:
+        _export_outputs(v2, debug, out_path)
 
     return v2, debug
 
@@ -686,6 +851,27 @@ def _normalizer_onteszt():
     assert kerulet_from_telepules_nev("Pécs") is None
     assert kerulet_from_telepules_nev("Budapest") is None  # nincs kerület-token
 
+    # 2026-os telepnev-forma: "Budapest XII" (nincs "kerület" utótag)
+    assert kerulet_from_telepules_nev("Budapest XII") == 12
+    assert kerulet_from_telepules_nev("Budapest I") == 1
+    assert kerulet_from_telepules_nev("Budapest XXIII") == 23
+    assert kerulet_from_telepules_nev("budapest 12") == 12
+    assert kerulet_from_telepules_nev("XII") is None       # se prefix, se utótag
+    assert kerulet_from_telepules_nev("Budapest XXIV") is None
+    assert telepules_fp("Budapest VI") == "budapest"
+
+    # kanonikus kerületnevek — pontosan a varosok.txt-beli alak
+    assert len(BP_KERULET_NEV) == 23
+    assert kerulet_nev(1) == "Budapest I. kerület"
+    assert kerulet_nev(23) == "Budapest XXIII. kerület"
+    assert kerulet_nev(None) is None and kerulet_nev(pd.NA) is None and kerulet_nev(0) is None
+    _vt = "../data/nyers_data/varosok.txt"
+    if os.path.exists(_vt):
+        with open(_vt, encoding="utf-8") as f:
+            _nevek = {v.strip() for v in f if v.strip()}
+        _hianyzo = [n for n in BP_KERULET_NEV.values() if n not in _nevek]
+        assert not _hianyzo, f"varosok.txt-ből hiányzó kanonikus kerületnév: {_hianyzo}"
+
     # kerület-kinyerés postcode-ból
     assert kerulet_from_postcode("1219") == 21
     assert kerulet_from_postcode("1011") == 1
@@ -708,4 +894,18 @@ def _normalizer_onteszt():
 
 if __name__ == '__main__':
     _normalizer_onteszt()
-    szkid_cim_kapcsolas()
+
+    # 2022 cím generálás (2014–2022-es formátum)
+    print("2022 cím generálás")
+    szkid_cim_kapcsolas('../data/nyers_data/valasztas_cimek_2022.csv',
+                        '../data/work_data/osszekapcsolt_pontok_es_cimek_2022')
+
+    # 2014 cím generálás
+    print("2014 cím generálás")
+    szkid_cim_kapcsolas('../data/nyers_data/valasztas_cimek_2014.csv',
+                        '../data/work_data/osszekapcsolt_pontok_es_cimek_2014')
+
+    # 2026 cím generálás (2026-os formátum, irsz-kulcsos)
+    print("2026 cím generálás")
+    szkid_cim_kapcsolas_v2('../data/nyers_data/szavkor2026.csv',
+                           '../data/work_data/osszekapcsolt_pontok_es_cimek_2026')

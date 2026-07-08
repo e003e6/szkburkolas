@@ -71,15 +71,20 @@ def poly_gen_pipeline(VAROS, MAX_EXT=200.0, EPS=0.25, DIST_LIM=100.0, MIN_SEG=0.
 
 
 
-def generalas_pipeline(VAROS, debug=False, export=True):
+def generalas_pipeline(VAROS, debug=False, export=True, cimek_gpkg=None, cimek_gdf=None):
 
     debug_path = f"./adatok/{VAROS}_debug.gpkg" if debug else None
 
-    # beolvasom az összekapcsolt pontok df-et
-    gdf = gpd.read_file('../data/work_data/osszekapcsolt_pontok_es_cimek_v2.gpkg')
+    # bemeneti összekapcsolt pontok (az adatstruktua/szkid_cim_kapcsolas.py kimenete,
+    # egységes séma): vagy előre betöltött GeoDataFrame (batch: egyszer olvassuk be),
+    # vagy fájlból a cimek_gpkg úton — az egyiket kötelező megadni.
+    if cimek_gdf is None:
+        if cimek_gpkg is None:
+            raise ValueError("Add meg a bemenetet: cimek_gpkg (összekapcsolt gpkg útja) vagy cimek_gdf.")
+        cimek_gdf = gpd.read_file(cimek_gpkg)
 
-    # szűröm városra és választásra
-    gdf = gdf.query('telepules == @VAROS')
+    # szűröm városra és választásra (copy: a megosztott gdf-et ne mutáljuk a színezéskor)
+    gdf = cimek_gdf.query('telepules == @VAROS').copy()
 
     # ha nincs egyetlen szavazóköri cím sem ezzel a településnévvel, kilépünk
     # (nem dobunk hibát, hogy batch-futtatásnál ne álljon le az egész)
@@ -152,14 +157,16 @@ def generalas_pipeline(VAROS, debug=False, export=True):
     merged = polir(merged, gdf, edges, debug_path=debug_path)
 
     if export:
-        merged.to_file(f'./adatok/{VAROS}_szigetek_besorolt_5.gpkg', layer='network_polygons', driver='GPKG')
-        gdf.to_file(f'./adatok/{VAROS}_cimek_besorolt.gpkg', layer='network_polygons', driver='GPKG')
+        merged.to_file(f'./adatok/{VAROS}_szigetek_besorolt_26.gpkg', layer='network_polygons', driver='GPKG')
+        gdf.to_file(f'./adatok/{VAROS}_cimek_besorolt_26.gpkg', layer='network_polygons', driver='GPKG')
 
     return gdf, merged
 
 
 
 if __name__ == "__main__":
-    VAROS = 'Halásztelek'       # Kétvölgy
+    # Az EGYETLEN bemenet: az összekapcsolt gpkg konkrét elérési útja.
+    CIMEK_GPKG = '../data/work_data/osszekapcsolt_pontok_es_cimek_2026.gpkg'
+    VAROS = 'Budapest V. kerület'       # Kétvölgy
 
-    gdf, gdf_szigetek = generalas_pipeline(VAROS, debug=True)
+    gdf, gdf_szigetek = generalas_pipeline(VAROS, debug=True, cimek_gpkg=CIMEK_GPKG)
