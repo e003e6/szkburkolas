@@ -24,7 +24,6 @@ import io
 import multiprocessing
 import os
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import geopandas as gpd
@@ -36,7 +35,12 @@ from burkolas_multiple import (
 
 ROOT = Path(__file__).resolve().parent.parent
 
-MAX_TASKS_PER_CHILD = 25  # ennyi város után a worker-processz újraindul (lapos memória)
+# Ennyi város után a worker-processz újraindul (lapos memória a többnapos futásnál).
+# FONTOS: multiprocessing.Pool-t használunk, NEM concurrent.futures.ProcessPoolExecutor-t —
+# az executor a max_tasks_per_child miatt kilépő workereket nem pótolja megbízhatóan, ha
+# minden task előre be van küldve (a pool 1 processzre sorvad, empirikusan reprodukálva
+# Python 3.13.1-en). A mp.Pool külön worker-karbantartó szála mindig visszapótol.
+MAX_TASKS_PER_CHILD = 25
 
 
 def _worker_init():
@@ -45,9 +49,12 @@ def _worker_init():
     os.environ['MPLBACKEND'] = 'Agg'
 
 
-def _worker(VAROS, cimek_sub, target_crs):
+def _worker(task):
     """Egy város teljes generálása. A soros burkolas_multiple ciklustörzsének
     worker-oldali fele: pipeline + reprojekció + telepules oszlop. Fájlba NEM ír.
+
+    task = (VAROS, cimek_sub, target_crs) — egyetlen argumentum, mert a
+    Pool.imap_unordered így adja át.
 
     A generalas_pipeline print-kimenetét elkapjuk és visszaadjuk, hogy a fő processz
     városonként egyben logolhassa (ne keveredjen össze a párhuzamos kimenet).
@@ -55,9 +62,14 @@ def _worker(VAROS, cimek_sub, target_crs):
     Visszatérés: (VAROS, status, gdf, merged, log_text)
       status: 'ok' | 'nincs' | 'ures' | 'hiba' (hibánál a log_text a traceback).
     """
+    VAROS, cimek_sub, target_crs = task
     # az import itt történik, hogy a spawn-olt worker a _worker_init utáni
     # környezettel töltse be a burkolas_v3-at (matplotlib backend)
     from burkolas_v3 import generalas_pipeline
+
+    # élő státusz a terminálra (a worker örökli a konzolt): látszik, éppen melyik
+    # településen dolgoznak a magok — nagyvárosnál sokáig ez az egyetlen életjel
+    print(f"  ... dolgozom: {VAROS} ({len(cimek_sub)} cím) [pid={os.getpid()}]", flush=True)
 
     out = io.StringIO()
     try:
@@ -129,16 +141,17 @@ def burkolas_multiple_tobbmag(cimek_gpkg, out_gpkg,
         else:
             fuggo.append(VAROS)
 
-    ctx = multiprocessing.get_context('spawn')
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx,
-                             initializer=_worker_init,
-                             max_tasks_per_child=MAX_TASKS_PER_CHILD) as pool:
-        futures = [pool.submit(_worker, VAROS, cimek_by_varos.get(VAROS, ures_sub), target_crs)
-                   for VAROS in fuggo]
+    # SZÁNDÉKOSAN a varosok.txt eredeti sorrendjében megyünk (kicsik-nagyok vegyesen):
+    # ha méret szerint rendeznénk (nagyok előre), az összes worker órákig egy-egy
+    # óriásvároson ülne, és addig SEMMI kimenet nem születne — se terminál, se gpkg.
+    # Vegyes sorrendnél folyamatosan készülnek el települések, látszik a haladás.
+    tasks = [(VAROS, cimek_by_varos.get(VAROS, ures_sub), target_crs) for VAROS in fuggo]
 
+    ctx = multiprocessing.get_context('spawn')
+    with ctx.Pool(processes=n_workers, initializer=_worker_init,
+                  maxtasksperchild=MAX_TASKS_PER_CHILD) as pool:
         done = n_skip
-        for fut in as_completed(futures):
-            VAROS, status, gdf, merged, log_text = fut.result()
+        for VAROS, status, gdf, merged, log_text in pool.imap_unordered(_worker, tasks, chunksize=1):
             done += 1
             pct = done / total * 100
             print(f"=== {VAROS} ===  [{done}/{total} — {pct:.1f}%] — {status}", flush=True)
@@ -181,9 +194,9 @@ def burkolas_multiple_tobbmag(cimek_gpkg, out_gpkg,
 
 if __name__ == '__main__':
     # Bemenet: az összekapcsolt gpkg konkrét elérési útja.
-    CIMEK_GPKG = ROOT / 'data' / 'work_data' / 'osszekapcsolt_pontok_es_cimek_2026.gpkg'
+    CIMEK_GPKG = ROOT / 'data' / 'work_data' / 'osszekapcsolt_pontok_es_cimek_2014.gpkg'
     # Kimenet: a gyűjtő gpkg konkrét elérési útja (a log mellé kerül: 2026_uj_log.txt).
-    OUT_GPKG = ROOT / 'data' / 'kesz_data' / '2026_tobbmag.gpkg'
+    OUT_GPKG = ROOT / 'data' / 'kesz_data' / '2014_tobbmag.gpkg'
 
     # Burkolás minden településre több magon — a gyűjtőben már meglévőket kihagyja.
     burkolas_multiple_tobbmag(CIMEK_GPKG, OUT_GPKG)
