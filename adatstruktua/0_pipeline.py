@@ -7,7 +7,7 @@ from osm_gmaps_egyesites import osm_gmaps_egyesites
 from gm_osm_lekerdezes import gm_osm_lekerdezes
 from szkid_cim_kapcsolas import szkid_cim_kapcsolas, szkid_cim_kapcsolas_v2
 from ms_ures_sample import ms_ures_sample
-from osm_letoltes import osm_letoltes
+from osm_letoltes import osm_letoltes, osm_letoltes_v3
 
 
 
@@ -49,6 +49,14 @@ def pipeline():
     #    3. varos_nodes -> utcahálózat pontjai
     #    4. varos_edges -> utcahálózat élei
     osm_letoltes()
+
+    # V3 burkolás bemenetei: 'all' utcahálózat (gyalogutak is) + vasút/folyó vonalak
+    #  Input:
+    #    1. varosok.txt
+    #  Output:
+    #    1. utcak_all_edges -> 'all' hálózat élei (u, v, key, osmid, highway, name, service)
+    #    2. vasut_folyo -> railway=rail és waterway=river/stream/canal vonalak
+    osm_letoltes_v3()
 
     # Microsoft éppletek van ahol nincsenek, ezeket a chunkokat azonosítjuk
     #  Input: 

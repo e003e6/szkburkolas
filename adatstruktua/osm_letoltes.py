@@ -4,6 +4,9 @@ Letölti minden városra (data/nyers_data/varosok.txt) az OSM adatokat WGS84-ben
   - varos_lakottterulet_hatar.parquet   (lakott terület, landuse=residential)
   - utcak_nodes.parquet
   - utcak_edges.parquet
+  V3 burkoláshoz (osm_letoltes_v3, külön parquet-ek, a fentiek érintetlenek):
+  - utcak_all_edges.parquet              (network_type='all': minden járható út, gyalogút is)
+  - vasut_folyo.parquet                  (railway=rail, waterway=river/stream/canal vonalak)
 
 Futtatási módok:
   - osm_letoltes()                      → teljes varosok.txt, felülírás (régi viselkedés),
@@ -47,7 +50,17 @@ HATAR_PARQUET = DATA / 'varos_kozigazgatasi_hatar.parquet'
 LAKOTT_PARQUET = DATA / 'varos_lakottterulet_hatar.parquet'
 NODES_PARQUET = DATA / 'utcak_nodes.parquet'
 EDGES_PARQUET = DATA / 'utcak_edges.parquet'
+EDGES_ALL_PARQUET = DATA / 'utcak_all_edges.parquet'   # V3: 'all' hálózat élei
+VASUT_FOLYO_PARQUET = DATA / 'vasut_folyo.parquet'     # V3: vasút + folyó vonalak
 HIBAK_TXT = DATA / 'osm_letoltes_hibak.txt'
+
+# V3 rétegnevek a hibafájlban (a régi 'határ' / 'lakott' / 'utcahálózat' mellett)
+HIBA_RETEG_ALL = 'utcahálózat_all'
+HIBA_RETEG_VASUT = 'vasut_folyo'
+
+# A V3 burkolásnak ezek az oszlopok kellenek az 'all' élekből (a többi osmnx-oszlop fölösleges)
+ALL_EDGE_OSZLOPOK = ['u', 'v', 'key', 'osmid', 'highway', 'name', 'service', 'geometry']
+VASUT_FOLYO_TAGS = {'railway': 'rail', 'waterway': ['river', 'stream', 'canal']}
 
 ox.settings.use_cache = True
 ox.settings.requests_timeout = 300
@@ -327,8 +340,231 @@ def budapest_keruletek_letoltes(append=True):
     _hibak_mentes(hibak, csere_telepulesek=csere, append=append)
     print('Budapest-ág kész.')
 
+# ----------------------------------------------------------------------------------------
+# V3-ág: 'all' hálózat + vasút/folyó (a V3 burkolás bemenete; a régi 4 parquet érintetlen)
+# ----------------------------------------------------------------------------------------
+
+def _all_edges_gdf(G, telepules):
+    """Egy 'all' gráf éleit a V3-nak kellő oszlopokra szűkíti és telepules-címkével látja el.
+    Hiányzó oszlop (pl. 'service' egy kis faluban) None-nal pótolva, hogy a parquet sémája
+    településenként azonos legyen."""
+    e = ox.graph_to_gdfs(G, nodes=False, edges=True).reset_index()
+    for oszlop in ALL_EDGE_OSZLOPOK:
+        if oszlop not in e.columns:
+            e[oszlop] = None
+    e = e[ALL_EDGE_OSZLOPOK].copy()
+    e['telepules'] = telepules
+    return e
+
+
+def _vasut_folyo_sorok(feat, telepules, vago_poligon=None):
+    """A features_from_place eredményéből a vasút/folyó VONALAKAT szedi ki soronként:
+    [{'tipus': 'vasút'|'folyó', 'geometry', 'telepules'}]. Poligon-geometriát (pl. folyó-
+    terület) eldob. vago_poligon megadásával (Budapest-ág) a vonalakat a kerülethatárra vágja
+    és a MultiLineString-eket darabolja."""
+    sorok = []
+    if feat is None or feat.empty:
+        return sorok
+    feat = feat[feat.geometry.type.isin(['LineString', 'MultiLineString'])]
+    for _, sor in feat.iterrows():
+        # típus: a railway címke ad vasutat, a waterway folyót
+        tipus = 'vasút' if isinstance(sor.get('railway'), str) and sor.get('railway') == 'rail' else 'folyó'
+        geom = sor.geometry
+        if vago_poligon is not None:
+            geom = geom.intersection(vago_poligon)
+        if geom is None or geom.is_empty:
+            continue
+        # MultiLineString → darabok; GeometryCollection → csak a vonalak
+        for darab in getattr(geom, 'geoms', [geom]):
+            if darab.geom_type == 'LineString' and not darab.is_empty:
+                sorok.append({'tipus': tipus, 'geometry': darab, 'telepules': telepules})
+    return sorok
+
+
+def _mentes_v3(edges_all, vasut_folyo, csere_telepulesek, append):
+    """A két V3-réteg kiírása/merge-elése (ugyanazzal a _parquet_merge logikával)."""
+    if edges_all:
+        _parquet_merge(EDGES_ALL_PARQUET, pd.concat(edges_all, ignore_index=True),
+                       csere_telepulesek, append)
+    if vasut_folyo:
+        _parquet_merge(VASUT_FOLYO_PARQUET,
+                       gpd.GeoDataFrame(vasut_folyo, geometry='geometry', crs='EPSG:4326'),
+                       csere_telepulesek, append)
+
+
+def _ujraprobalva(hivas, probak=4, varakozas=30):
+    """Az Overpass nyilvános szervere túlterhelésnél 502-t ad: ilyenkor exponenciális várakozással
+    újrapróbáljuk (30, 60, 120 s). Más hibát (pl. Nominatim nem talál) azonnal továbbadunk."""
+    import time
+    for i in range(probak):
+        try:
+            return hivas()
+        except Exception as ex:
+            tulterhelt = '502' in str(ex) or '504' in str(ex) or '429' in str(ex) or 'timed out' in str(ex).lower()
+            if not tulterhelt or i == probak - 1:
+                raise
+            print(f'    Overpass túlterhelt, újrapróbálás {varakozas} s múlva ({i + 1}/{probak - 1})')
+            time.sleep(varakozas)
+            varakozas *= 2
+
+
+def osm_letoltes_v3_adagokban(varosok, adag=50):
+    """Országos futáshoz: a településeket `adag` méretű csoportokban tölti és MENTI (append-merge),
+    így egy megszakadás legfeljebb egy adagnyi munkát visz el. A Budapest-neveket kihagyja, ha a
+    23 kerület már a cache-ben van."""
+    megvan = set()
+    if EDGES_ALL_PARQUET.exists():
+        megvan = set(pq.read_table(EDGES_ALL_PARQUET, columns=['telepules'])['telepules'].to_pylist())
+    if all(nev in megvan for nev in BP_KERULET_NEV.values()):
+        varosok = [v for v in varosok if not (v == 'Budapest' or 'kerület' in v)]
+    for i in range(0, len(varosok), adag):
+        resz = varosok[i:i + adag]
+        print(f'=== adag {i // adag + 1}/{(len(varosok) + adag - 1) // adag}: {resz[0]} … {resz[-1]} ===', flush=True)
+        osm_letoltes_v3(resz, append=True)
+
+
+def hianyzo_varosok_v3():
+    """varosok.txt mínusz az utcak_all_edges.parquet-ben már meglévők, mínusz azok, amelyeknél
+    a hibafájl 'utcahálózat_all' hibát rögzített (hálózat nélküli aprófalvak – ezeket nem
+    próbáljuk újra minden futásnál). Sorrendtartó."""
+    varosok = [v.strip() for v in (DATA / 'varosok.txt').read_text(encoding='utf-8').splitlines() if v.strip()]
+    megvan = set()
+    if EDGES_ALL_PARQUET.exists():
+        megvan = set(pq.read_table(EDGES_ALL_PARQUET, columns=['telepules'])['telepules'].to_pylist())
+    hibas = set()
+    if HIBAK_TXT.exists():
+        for sor in HIBAK_TXT.read_text(encoding='utf-8').splitlines():
+            mezok = sor.split('\t')
+            if len(mezok) >= 2 and mezok[1] == HIBA_RETEG_ALL:
+                hibas.add(mezok[0])
+    return [v for v in varosok if v not in megvan and v not in hibas]
+
+
+def osm_letoltes_v3(varosok=None, append=None):
+    """V3 bemenetek letöltése: 'all' utcahálózat élei + vasút/folyó vonalak, településenként.
+    varosok=None → teljes varosok.txt és felülírás; megadott lista → csak azok, append-merge.
+    A Budapest-neveket a geokódos ág kihagyja, a végén a Budapest-ág fut le rájuk.
+    Ha egy településen nincs vasút/folyó, az NEM hiba (üres réteg normális)."""
+    if append is None:
+        append = varosok is not None
+    if varosok is None:
+        varosok = [v.strip() for v in (DATA / 'varosok.txt').read_text(encoding='utf-8').splitlines() if v.strip()]
+
+    bp_nevek = [v for v in varosok if v == 'Budapest' or 'kerület' in v]
+    varosok = [v for v in varosok if v not in set(bp_nevek)]
+
+    edges_all, vasut_folyo = [], []
+    hibak = []
+
+    def hiba(varos, retek, uzenet):
+        sor = f'{varos}\t{retek}\t{uzenet}'
+        print(f'  {retek} hiba ({varos}): {uzenet}')
+        hibak.append(sor)
+
+    for i, varos in enumerate(varosok, 1):
+        print(f'[V3 {i}/{len(varosok)}] {varos}')
+        query = {'city': varos, 'country': 'Hungary'}
+
+        # 'all' hálózat: minden gépjárművel és gyalogosan járható út (leírás: Bemenetek)
+        try:
+            G = _ujraprobalva(lambda: ox.graph_from_place(query, network_type='all'))
+            edges_all.append(_all_edges_gdf(G, varos))
+        except Exception as ex:
+            hiba(varos, HIBA_RETEG_ALL, str(ex))
+
+        # vasút + folyó (leírás: rang 6 vonalak)
+        try:
+            feat = _ujraprobalva(lambda: ox.features_from_place(query, tags=VASUT_FOLYO_TAGS))
+            vasut_folyo.extend(_vasut_folyo_sorok(feat, varos))
+        except ox._errors.InsufficientResponseError:
+            pass  # nincs vasút/folyó a településen – normális
+        except Exception as ex:
+            hiba(varos, HIBA_RETEG_VASUT, str(ex))
+
+    if varosok:
+        _mentes_v3(edges_all, vasut_folyo, csere_telepulesek=set(varosok), append=append)
+        _hibak_mentes(hibak, csere_telepulesek=set(varosok), append=append)
+
+    if bp_nevek:
+        budapest_keruletek_letoltes_v3(append=True)
+
+
+def budapest_vasut_folyo(ker, hiba):
+    """Vasút + folyó egész Budapestre egy lekérdezéssel, kerülethatárra vágva. Külön függvény,
+    hogy Overpass-hiba (502) után a gráf újratöltése nélkül megismételhető legyen."""
+    print('Budapest V3-ág: vasút + folyó (egész város)...')
+    vasut_folyo = []
+    try:
+        feat = ox.features_from_place(BUDAPEST_QUERY, tags=VASUT_FOLYO_TAGS)
+        feat = feat[feat.geometry.type.isin(['LineString', 'MultiLineString'])]
+        for k in ker.itertuples():
+            kpoly = make_valid(k.geometry)
+            vasut_folyo.extend(_vasut_folyo_sorok(feat, k.telepules, vago_poligon=kpoly))
+    except ox._errors.InsufficientResponseError:
+        pass
+    except Exception as ex:
+        hiba('Budapest', HIBA_RETEG_VASUT, str(ex))
+    return vasut_folyo
+
+
+def budapest_vasut_folyo_potlas():
+    """Csak a budapesti vasút/folyó réteg (újra)letöltése és merge-elése a parquet-be."""
+    ker = budapest_keruletek_hatarok()
+    hibak = []
+
+    def hiba(varos, retek, uzenet):
+        print(f'  {retek} hiba ({varos}): {uzenet}')
+        hibak.append(f'{varos}\t{retek}\t{uzenet}')
+
+    vasut_folyo = budapest_vasut_folyo(ker, hiba)
+    if vasut_folyo:
+        _parquet_merge(VASUT_FOLYO_PARQUET,
+                       gpd.GeoDataFrame(vasut_folyo, geometry='geometry', crs='EPSG:4326'),
+                       csere_telepulesek=set(ker['telepules']), append=True)
+    print(f'Budapest vasút/folyó: {len(vasut_folyo)} vonal')
+    return hibak
+
+
+def budapest_keruletek_letoltes_v3(append=True):
+    """Budapest V3-ága: egész-városi 'all' gráf EGY letöltéssel, kerületenként truncate-elve;
+    vasút/folyó egész városra lekérdezve, kerülethatárra vágva. Kerület-címkés sorok kerülnek a
+    parquet-ekbe (egész-városi 'Budapest' sor nincs: a burkolás kerületenként dolgozik)."""
+    print('Budapest V3-ág: kerülethatárok (admin_level=9)...')
+    ker = budapest_keruletek_hatarok()
+
+    hibak = []
+
+    def hiba(varos, retek, uzenet):
+        sor = f'{varos}\t{retek}\t{uzenet}'
+        print(f'  {retek} hiba ({varos}): {uzenet}')
+        hibak.append(sor)
+
+    print("Budapest V3-ág: 'all' gráf (egész város, ez sokáig tarthat)...")
+    G = ox.graph_from_place(BUDAPEST_QUERY, network_type='all')
+    print(f'  egész-városi all-gráf: {len(G.nodes)} node, {len(G.edges)} él. Kerület-vágás...')
+    edges_all = []
+    for k in ker.itertuples():
+        try:
+            Gd = ox.truncate.truncate_graph_polygon(G.copy(), k.geometry, truncate_by_edge=True)
+            if len(Gd.edges) == 0:
+                raise ValueError('üres kerületi gráf')
+            e = _all_edges_gdf(Gd, k.telepules)
+            edges_all.append(e)
+            print(f'  {k.telepules}: {len(e)} él')
+        except Exception as ex:
+            hiba(k.telepules, HIBA_RETEG_ALL, str(ex))
+
+    vasut_folyo = budapest_vasut_folyo(ker, hiba)
+
+    csere = set(ker['telepules'])
+    _mentes_v3(edges_all, vasut_folyo, csere_telepulesek=csere, append=append)
+    _hibak_mentes(hibak, csere_telepulesek=csere, append=append)
+    print('Budapest V3-ág kész.')
+
 
 if __name__ == '__main__':
     # Inkrementális pótlás: csak a hiányzó települések (+ Budapest-ág, ha érintett).
     # Teljes újratöltéshez: osm_letoltes()
     osm_letoltes(hianyzo_varosok(), append=True)
+    # V3 bemenetek ('all' hálózat + vasút/folyó) inkrementális pótlása
+    osm_letoltes_v3_adagokban(hianyzo_varosok_v3())
